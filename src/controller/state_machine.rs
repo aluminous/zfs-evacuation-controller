@@ -190,13 +190,11 @@ async fn cancel_reason(
                 // Cancel only when the source node still exists AND no longer
                 // carries the taint. A vanished node is not a cancel — the
                 // whole point is evacuating ahead of removal.
-                if let Some(src) = &st.source {
-                    if let Some(node) = ctx.nodes().get_opt(&src.node).await? {
-                        if !crate::controller::node_has_evacuate_taint(&node, &ctx.cfg.taint_key) {
+                if let Some(src) = &st.source
+                    && let Some(node) = ctx.nodes().get_opt(&src.node).await?
+                        && !crate::controller::node_has_evacuate_taint(&node, &ctx.cfg.taint_key) {
                             return Ok(Some("source node's evacuate taint removed (cancelled)".into()));
                         }
-                    }
-                }
             }
         },
     }
