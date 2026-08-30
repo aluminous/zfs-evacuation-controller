@@ -180,11 +180,25 @@ async fn cancel_reason(
     }
     match ctx.pvs().get_opt(&evac.spec.pv_name).await? {
         None => return Ok(Some("source PV disappeared before commit".into())),
-        Some(pv) => {
-            if pv.annotations().get(EVACUATE_ANNOTATION).map(String::as_str) != Some("true") {
-                return Ok(Some("evacuate annotation removed (cancelled)".into()));
+        Some(pv) => match evac.spec.trigger {
+            crate::crd::zfs_evacuation::EvacuationTrigger::Annotation => {
+                if pv.annotations().get(EVACUATE_ANNOTATION).map(String::as_str) != Some("true") {
+                    return Ok(Some("evacuate annotation removed (cancelled)".into()));
+                }
             }
-        }
+            crate::crd::zfs_evacuation::EvacuationTrigger::NodeTaint => {
+                // Cancel only when the source node still exists AND no longer
+                // carries the taint. A vanished node is not a cancel — the
+                // whole point is evacuating ahead of removal.
+                if let Some(src) = &st.source {
+                    if let Some(node) = ctx.nodes().get_opt(&src.node).await? {
+                        if !crate::controller::node_has_evacuate_taint(&node, &ctx.cfg.taint_key) {
+                            return Ok(Some("source node's evacuate taint removed (cancelled)".into()));
+                        }
+                    }
+                }
+            }
+        },
     }
     if let Some(pvc_ref) = &st.pvc_ref {
         match ctx

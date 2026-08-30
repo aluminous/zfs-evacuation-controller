@@ -41,6 +41,8 @@ async fn main() -> Result<()> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(120),
+        taint_key: std::env::var("EVACUATE_TAINT_KEY")
+            .unwrap_or_else(|_| "zfsevac.alumino.us/evacuate".into()),
     };
 
     let client = Client::try_default().await?;

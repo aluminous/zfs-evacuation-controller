@@ -43,8 +43,14 @@ and everything referencing it — is untouched.
 kubectl apply -f deploy/crds.yaml -f deploy/rbac.yaml \
   -f deploy/admission.yaml -f deploy/controller.yaml
 
-# Phase-1 trigger: annotate the PV. Evacuation starts once no pod uses it.
-kubectl annotate pv pvc-1234... zfsevac.io/evacuate=true
+# Trigger 1: annotate a PV. Evacuation starts once no pod uses it.
+kubectl annotate pv pvc-1234... zfsevac.alumino.us/evacuate=true
+
+# Trigger 2: taint a node (any effect) to evacuate ALL its zfs-localpv
+# volumes as each becomes unused. Nothing is evicted — drain pods yourself
+# (or let workloads finish); each volume migrates when its PVC is idle.
+# A tainted node is also excluded as an evacuation target.
+kubectl taint node worker-3 zfsevac.alumino.us/evacuate=:PreferNoSchedule
 
 kubectl get zfsevacuations        # short name: zevac
 ```
@@ -71,8 +77,12 @@ Refused up front: volumes with ZFSSnapshots, clones, `marked-for-deletion`,
 or an in-flight resize; volumes whose source node is already gone (the data
 is unreachable — restore from backup instead). One transfer per source and
 per target node at a time; full (non-incremental) send per attempt; same pool
-name on the target by default. A node-taint trigger (evacuate everything on a
-node) is planned as a thin fan-out on top of the same CRs.
+name on the target by default.
+
+Cancel semantics per trigger: annotation evacuations cancel when the
+annotation is removed; taint evacuations cancel when the source node's taint
+is removed (a *deleted* node is not a cancel). The taint key defaults to
+`zfsevac.alumino.us/evacuate` (env `EVACUATE_TAINT_KEY`).
 
 ## Operational notes
 

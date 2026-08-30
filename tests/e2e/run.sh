@@ -59,7 +59,7 @@ log "test 3 precondition: pre-create a colliding dataset name on both nodes"
 $NODE2_SSH sudo zfs create -V 8M "tank/${OLD_HANDLE}-collision" 2>/dev/null || true
 
 log "trigger evacuation of $PV (handle $OLD_HANDLE)"
-kubectl annotate pv "$PV" zfsevac.io/evacuate=true
+kubectl annotate pv "$PV" zfsevac.alumino.us/evacuate=true
 
 wait_for 60 "ZFSEvacuation created" kubectl get zfsevacuation "$PV"
 

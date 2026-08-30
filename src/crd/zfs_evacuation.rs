@@ -8,21 +8,21 @@ use serde::{Deserialize, Serialize};
 
 /// PV annotation that triggers an evacuation ("true" = evacuate when unused).
 /// Removing it before the commit point cancels the evacuation.
-pub const EVACUATE_ANNOTATION: &str = "zfsevac.io/evacuate";
+pub const EVACUATE_ANNOTATION: &str = "zfsevac.alumino.us/evacuate";
 /// Our user-finalizer placed on the source ZFSVolume: the zfs-localpv node
 /// agent will not `zfs destroy` while it is present.
-pub const GUARD_FINALIZER: &str = "zfsevac.io/guard";
+pub const GUARD_FINALIZER: &str = "zfsevac.alumino.us/guard";
 /// Finalizer on ZFSEvacuation so deletion runs abort logic.
-pub const EVACUATION_FINALIZER: &str = "zfsevac.io/cleanup";
+pub const EVACUATION_FINALIZER: &str = "zfsevac.alumino.us/cleanup";
 /// Human-visible marker label put on the PVC while evacuating (the actual
 /// attach lock is the VAP param object, not this label).
-pub const EVACUATING_LABEL: &str = "zfsevac.io/evacuating";
+pub const EVACUATING_LABEL: &str = "zfsevac.alumino.us/evacuating";
 /// Fixed name of the singleton EvacuationParams object the VAP binding references.
 pub const PARAMS_NAME: &str = "zfs-evacuation-locks";
 
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
 #[kube(
-    group = "zfsevac.io",
+    group = "zfsevac.alumino.us",
     version = "v1alpha1",
     kind = "ZFSEvacuation",
     plural = "zfsevacuations",
@@ -36,6 +36,11 @@ pub const PARAMS_NAME: &str = "zfs-evacuation-locks";
 pub struct ZFSEvacuationSpec {
     /// Name of the PV to evacuate (immutable; also the ZFSEvacuation name).
     pub pv_name: String,
+    /// What created this evacuation — governs the cancel condition:
+    /// Annotation evacuations cancel when the PV annotation is removed,
+    /// NodeTaint evacuations cancel when the source node's taint is removed.
+    #[serde(default)]
+    pub trigger: EvacuationTrigger,
     /// Optional explicit target node (else auto-selected).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_node: Option<String>,
@@ -55,6 +60,13 @@ pub struct ZFSEvacuationSpec {
     /// Extra free-space headroom required on the target pool, percent. Default 10.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headroom_percent: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema, PartialEq, Eq)]
+pub enum EvacuationTrigger {
+    #[default]
+    Annotation,
+    NodeTaint,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema, PartialEq, Eq)]
@@ -162,7 +174,7 @@ pub struct ZFSEvacuationStatus {
 /// instance named [`PARAMS_NAME`] holds every PVC currently locked.
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
 #[kube(
-    group = "zfsevac.io",
+    group = "zfsevac.alumino.us",
     version = "v1alpha1",
     kind = "EvacuationParams",
     plural = "evacuationparams"

@@ -20,7 +20,7 @@ spec:
         operations: ["CREATE"]
         resources: ["pods"]
   paramKind:
-    apiVersion: zfsevac.io/v1alpha1
+    apiVersion: zfsevac.alumino.us/v1alpha1
     kind: EvacuationParams
   variables:
     - name: lockedKeys

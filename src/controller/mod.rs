@@ -45,6 +45,19 @@ pub struct Config {
     pub pod_namespace: String,
     /// Seconds without relay progress before an attempt is declared stalled.
     pub stall_seconds: u64,
+    /// Taint key that marks a node for evacuation (phase-2 trigger). A node
+    /// carrying this taint (any effect) has all its zfs-localpv volumes
+    /// evacuated as they become unused, and is excluded as a target.
+    pub taint_key: String,
+}
+
+/// Does the node carry the evacuate taint (any effect)?
+pub fn node_has_evacuate_taint(node: &Node, taint_key: &str) -> bool {
+    node.spec
+        .as_ref()
+        .and_then(|s| s.taints.as_ref())
+        .map(|ts| ts.iter().any(|t| t.key == taint_key))
+        .unwrap_or(false)
 }
 
 pub struct Ctx {

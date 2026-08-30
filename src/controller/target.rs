@@ -92,6 +92,10 @@ pub async fn select_target(ctx: &Ctx, input: &SelectionInput<'_>) -> Result<Targ
         if !node_is_ready(node) {
             continue;
         }
+        // A node marked for evacuation must never receive evacuated data.
+        if crate::controller::node_has_evacuate_taint(node, &ctx.cfg.taint_key) {
+            continue;
+        }
         if busy_targets.contains(&node_id) {
             continue;
         }

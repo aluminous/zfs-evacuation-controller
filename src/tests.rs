@@ -137,6 +137,27 @@ fn ipnet_matching() {
 }
 
 #[test]
+fn taint_matching() {
+    use crate::controller::node_has_evacuate_taint;
+    let key = "zfsevac.alumino.us/evacuate";
+    let tainted = from_value(json!({
+        "metadata": {"name": "n1"},
+        "spec": {"taints": [{"key": key, "effect": "PreferNoSchedule"}]}
+    }))
+    .unwrap();
+    assert!(node_has_evacuate_taint(&tainted, key));
+    // Any effect counts; other keys don't.
+    let other = from_value(json!({
+        "metadata": {"name": "n2"},
+        "spec": {"taints": [{"key": "node.kubernetes.io/unschedulable", "effect": "NoSchedule"}]}
+    }))
+    .unwrap();
+    assert!(!node_has_evacuate_taint(&other, key));
+    let bare = from_value(json!({"metadata": {"name": "n3"}, "spec": {}})).unwrap();
+    assert!(!node_has_evacuate_taint(&bare, key));
+}
+
+#[test]
 fn crd_generation_is_valid() {
     use kube::CustomResourceExt;
     let crd = crate::crd::zfs_evacuation::ZFSEvacuation::crd();

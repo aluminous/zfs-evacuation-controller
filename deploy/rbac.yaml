@@ -28,7 +28,7 @@ rules:
   - apiGroups: ["storage.k8s.io"]
     resources: ["storageclasses"]
     verbs: ["get", "list", "watch"]
-  - apiGroups: ["zfsevac.io"]
+  - apiGroups: ["zfsevac.alumino.us"]
     resources: ["zfsevacuations", "zfsevacuations/status", "evacuationparams"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: [""]
