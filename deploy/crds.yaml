@@ -1,0 +1,288 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: zfsevacuations.zfsevac.io
+spec:
+  group: zfsevac.io
+  names:
+    kind: ZFSEvacuation
+    plural: zfsevacuations
+    shortNames:
+    - zevac
+    singular: zfsevacuation
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.target.node
+      name: Target
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for ZFSEvacuationSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              headroomPercent:
+                description: Extra free-space headroom required on the target pool, percent. Default 10.
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+              maxAttempts:
+                description: Maximum transfer attempts. Default 3.
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+              pvName:
+                description: Name of the PV to evacuate (immutable; also the ZFSEvacuation name).
+                type: string
+              settleSeconds:
+                description: |-
+                  Seconds to wait after the last pod disappears before snapshotting
+                  (kubelet unmount lag). Default 90.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              targetNode:
+                description: Optional explicit target node (else auto-selected).
+                nullable: true
+                type: string
+              targetPool:
+                description: Optional explicit target pool (else same pool name as source).
+                nullable: true
+                type: string
+              transferTimeoutSeconds:
+                description: Per-attempt transfer timeout in seconds. Default 3600.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+            required:
+            - pvName
+            type: object
+          status:
+            nullable: true
+            properties:
+              committed:
+                default: false
+                description: Set once the old PV delete has been issued; from here, roll-forward only.
+                type: boolean
+              conditions:
+                default: []
+                items:
+                  description: Condition contains details for one aspect of the current state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: lastTransitionTime is the last time the condition transitioned from one status to another. This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: message is a human readable message indicating details about the transition. This may be an empty string.
+                      type: string
+                    observedGeneration:
+                      description: observedGeneration represents the .metadata.generation that the condition was set based upon. For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date with respect to the current state of the instance.
+                      format: int64
+                      type: integer
+                    reason:
+                      description: reason contains a programmatic identifier indicating the reason for the condition's last transition. Producers of specific condition types may define expected values and meanings for this field, and whether the values are considered a guaranteed API. The value should be a CamelCase string. This field may not be empty.
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              lockedAt:
+                description: RFC3339 time the PVC key was added to the VAP params (propagation grace).
+                nullable: true
+                type: string
+              message:
+                nullable: true
+                type: string
+              newPvManifest:
+                description: Serialized JSON of the fully-rendered replacement PV (crash recovery).
+                nullable: true
+                type: string
+              observedGeneration:
+                format: int64
+                nullable: true
+                type: integer
+              oldPvManifest:
+                description: Serialized JSON of the old PV, captured post-Retain (crash recovery).
+                nullable: true
+                type: string
+              originalReclaimPolicy:
+                nullable: true
+                type: string
+              phase:
+                default: Pending
+                enum:
+                - Pending
+                - Guarding
+                - Retaining
+                - Locking
+                - Quiescing
+                - TargetSelecting
+                - Transferring
+                - Adopting
+                - Committing
+                - Swapping
+                - CleaningUp
+                - Completed
+                - Aborting
+                - Failed
+                type: string
+              pvcRef:
+                nullable: true
+                properties:
+                  name:
+                    type: string
+                  namespace:
+                    type: string
+                  uid:
+                    type: string
+                required:
+                - name
+                - namespace
+                - uid
+                type: object
+              quiescedAt:
+                description: RFC3339 time the last referencing pod disappeared (settle-period anchor).
+                nullable: true
+                type: string
+              source:
+                nullable: true
+                properties:
+                  capacityBytes:
+                    default: 0
+                    description: Volume size in bytes (for target capacity reservations).
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  node:
+                    type: string
+                  nodeId:
+                    description: Resolved openebs.io/nodeid (label value, or node name).
+                    type: string
+                  pool:
+                    type: string
+                  pvUid:
+                    type: string
+                  volumeHandle:
+                    type: string
+                required:
+                - node
+                - nodeId
+                - pool
+                - pvUid
+                - volumeHandle
+                type: object
+              target:
+                nullable: true
+                properties:
+                  newVolumeHandle:
+                    type: string
+                  node:
+                    type: string
+                  nodeId:
+                    type: string
+                  pool:
+                    type: string
+                required:
+                - newVolumeHandle
+                - node
+                - nodeId
+                - pool
+                type: object
+              transfer:
+                nullable: true
+                properties:
+                  attempt:
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  bytesRelayed:
+                    format: uint64
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  ports:
+                    description: '[backup_port, restore_port] the relay listens on.'
+                    items:
+                      format: uint16
+                      maximum: 65535.0
+                      minimum: 0.0
+                      type: integer
+                    type: array
+                  snapName:
+                    type: string
+                  startedAt:
+                    nullable: true
+                    type: string
+                required:
+                - attempt
+                - ports
+                - snapName
+                type: object
+            type: object
+        required:
+        - spec
+        title: ZFSEvacuation
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: evacuationparams.zfsevac.io
+spec:
+  group: zfsevac.io
+  names:
+    kind: EvacuationParams
+    plural: evacuationparams
+    singular: evacuationparams
+  scope: Cluster
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for EvacuationParamsSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Param object for the ValidatingAdmissionPolicy. A single cluster-scoped
+              instance named [`PARAMS_NAME`] holds every PVC currently locked.
+            properties:
+              pvcKeys:
+                default: []
+                description: '"namespace/name" keys of PVCs that must not be referenced by new pods.'
+                items:
+                  type: string
+                type: array
+            type: object
+        required:
+        - spec
+        title: EvacuationParams
+        type: object
+    served: true
+    storage: true

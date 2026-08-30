@@ -1,0 +1,265 @@
+//! Commit-point rendering and the PV swap itself. The swap window (old PV
+//! deleted, new PV not yet created) is survivable only because both manifests
+//! are durable in status (and a recovery ConfigMap) before the first delete.
+
+use std::time::Duration;
+
+use anyhow::{anyhow, Context as _, Result};
+use k8s_openapi::api::core::v1::{ConfigMap, ObjectReference, PersistentVolume};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use kube::api::{Api, DeleteParams, Patch, PatchParams};
+use kube::runtime::controller::Action;
+use kube::{Resource, ResourceExt};
+use serde_json::json;
+
+use crate::controller::state_machine::{advance, fail, set_finalizers};
+use crate::controller::{pods_referencing_pvc, Ctx};
+use crate::crd::openebs::{NODE_ID_TOPOLOGY_KEY, POOLNAME_ATTRIBUTE};
+use crate::crd::zfs_evacuation::{Phase, ZFSEvacuation, ZFSEvacuationStatus};
+
+const PV_PROTECTION: &str = "kubernetes.io/pv-protection";
+const PROVISIONER_FINALIZER: &str = "external-provisioner.volume.kubernetes.io/finalizer";
+
+pub async fn committing(
+    ctx: &Ctx,
+    evac: &ZFSEvacuation,
+    st: &mut ZFSEvacuationStatus,
+) -> Result<Action> {
+    let name = evac.name_any();
+    let pvc_ref = st.pvc_ref.clone().ok_or_else(|| anyhow!("no pvcRef recorded"))?;
+    let source = st.source.clone().ok_or_else(|| anyhow!("no source recorded"))?;
+    let target = st.target.clone().ok_or_else(|| anyhow!("no target recorded"))?;
+
+    // Final invariant checks at the last cancelable moment.
+    let pvc = ctx
+        .pvcs(&pvc_ref.namespace)
+        .get_opt(&pvc_ref.name)
+        .await?
+        .ok_or_else(|| anyhow!("PVC vanished at commit"))?;
+    if pvc.uid().as_deref() != Some(pvc_ref.uid.as_str()) {
+        st.phase = Phase::Aborting;
+        st.message = Some("PVC UID changed at commit; aborting".into());
+        ctx.write_status(&name, st).await?;
+        return Ok(Action::requeue(Duration::from_secs(1)));
+    }
+    let pods = pods_referencing_pvc(&ctx.pods(&pvc_ref.namespace), &pvc_ref.name).await?;
+    if !pods.is_empty() {
+        // Should be impossible with the VAP lock; abort loudly rather than
+        // swap under a live consumer.
+        st.phase = Phase::Aborting;
+        st.message = Some(format!("pods appeared at commit despite lock: {}", pods.join(", ")));
+        ctx.write_status(&name, st).await?;
+        return Ok(Action::requeue(Duration::from_secs(1)));
+    }
+
+    let old_pv = ctx
+        .pvs()
+        .get_opt(&evac.spec.pv_name)
+        .await?
+        .ok_or_else(|| anyhow!("old PV vanished at commit"))?;
+    if old_pv.uid().as_deref() != Some(source.pv_uid.as_str()) {
+        return fail(ctx, &name, st, "old PV UID changed at commit").await;
+    }
+
+    let new_pv = render_new_pv(&old_pv, &pvc_ref, &target)?;
+
+    st.old_pv_manifest = Some(serde_json::to_string(&old_pv)?);
+    st.new_pv_manifest = Some(serde_json::to_string(&new_pv)?);
+    st.committed = true;
+    write_recovery_configmap(ctx, &name, st).await?;
+    // The status write below is the commit record; from here, roll forward only.
+    advance(ctx, &name, st, Phase::Swapping).await
+}
+
+/// Render the replacement PV: same name (PVC bindings survive), new
+/// volumeHandle/pool/nodeAffinity, pre-bound claimRef with the PVC's UID so
+/// the PV controller rebinds automatically, and reclaimPolicy Retain until
+/// the rebind is verified.
+pub fn render_new_pv(
+    old_pv: &PersistentVolume,
+    pvc_ref: &crate::crd::zfs_evacuation::PvcRef,
+    target: &crate::crd::zfs_evacuation::TargetInfo,
+) -> Result<PersistentVolume> {
+    // Keep annotations — pv.kubernetes.io/provisioned-by in particular, else
+    // the external-provisioner will never reclaim the new PV and the target
+    // dataset leaks at end-of-life. But drop our own evacuate trigger:
+    // carrying it over would re-evacuate the volume as soon as the Completed
+    // ZFSEvacuation is deleted.
+    let annotations = old_pv.metadata.annotations.clone().map(|mut a| {
+        a.remove(crate::crd::zfs_evacuation::EVACUATE_ANNOTATION);
+        a
+    });
+    let mut new_pv = PersistentVolume {
+        metadata: ObjectMeta {
+            name: old_pv.metadata.name.clone(),
+            labels: old_pv.metadata.labels.clone(),
+            annotations,
+            ..Default::default()
+        },
+        spec: old_pv.spec.clone(),
+        status: None,
+    };
+    let spec = new_pv.spec.as_mut().ok_or_else(|| anyhow!("old PV has no spec"))?;
+    spec.claim_ref = Some(ObjectReference {
+        api_version: Some("v1".into()),
+        kind: Some("PersistentVolumeClaim".into()),
+        namespace: Some(pvc_ref.namespace.clone()),
+        name: Some(pvc_ref.name.clone()),
+        uid: Some(pvc_ref.uid.clone()),
+        ..Default::default()
+    });
+    // Bring up as Retain; flipped back to the original policy after Bound.
+    spec.persistent_volume_reclaim_policy = Some("Retain".into());
+    spec.node_affinity = serde_json::from_value(json!({
+        "required": {
+            "nodeSelectorTerms": [{
+                "matchExpressions": [{
+                    "key": NODE_ID_TOPOLOGY_KEY,
+                    "operator": "In",
+                    "values": [target.node_id],
+                }]
+            }]
+        }
+    }))?;
+    let csi = spec
+        .csi
+        .as_mut()
+        .ok_or_else(|| anyhow!("old PV has no csi source"))?;
+    csi.volume_handle = target.new_volume_handle.clone();
+    if let Some(attrs) = csi.volume_attributes.as_mut()
+        && attrs.contains_key(POOLNAME_ATTRIBUTE) {
+            attrs.insert(POOLNAME_ATTRIBUTE.into(), target.pool.clone());
+        }
+    Ok(new_pv)
+}
+
+pub async fn swapping(
+    ctx: &Ctx,
+    evac: &ZFSEvacuation,
+    st: &mut ZFSEvacuationStatus,
+) -> Result<Action> {
+    let name = evac.name_any();
+    let source = st.source.clone().ok_or_else(|| anyhow!("no source recorded"))?;
+    let pvc_ref = st.pvc_ref.clone().ok_or_else(|| anyhow!("no pvcRef recorded"))?;
+    let pv_api = ctx.pvs();
+
+    match pv_api.get_opt(&evac.spec.pv_name).await? {
+        // Old PV still present: (re-)issue delete and strip the blocking
+        // finalizers — pv-protection blocks while the PV is Bound (we've
+        // verified quiescence), and the csi-provisioner's HonorPVReclaimPolicy
+        // finalizer may also linger (safe to strip: the policy is Retain, so
+        // the provisioner has no volume deletion to perform).
+        Some(pv) if pv.uid().as_deref() == Some(source.pv_uid.as_str()) => {
+            if pv.meta().deletion_timestamp.is_none() {
+                pv_api.delete(&evac.spec.pv_name, &DeleteParams::default()).await?;
+            }
+            set_finalizers(&pv_api, &evac.spec.pv_name, |cur| {
+                cur.iter()
+                    .filter(|f| *f != PV_PROTECTION && *f != PROVISIONER_FINALIZER)
+                    .cloned()
+                    .collect()
+            })
+            .await?;
+            Ok(Action::requeue(Duration::from_secs(2)))
+        }
+        // Gone: create the replacement from the stored manifest.
+        None => {
+            let manifest = st
+                .new_pv_manifest
+                .clone()
+                .ok_or_else(|| anyhow!("no newPVManifest recorded; cannot complete swap"))?;
+            let new_pv: PersistentVolume =
+                serde_json::from_str(&manifest).context("parsing stored newPVManifest")?;
+            match pv_api.create(&Default::default(), &new_pv).await {
+                Ok(_) => {}
+                Err(kube::Error::Api(e)) if e.code == 409 => {}
+                Err(e) => return Err(e.into()),
+            }
+            Ok(Action::requeue(Duration::from_secs(2)))
+        }
+        // A PV with a different UID: our replacement. Wait for rebind.
+        Some(pv) => {
+            let phase = pv
+                .status
+                .as_ref()
+                .and_then(|s| s.phase.clone())
+                .unwrap_or_default();
+            let claim_uid = pv
+                .spec
+                .as_ref()
+                .and_then(|s| s.claim_ref.as_ref())
+                .and_then(|c| c.uid.clone())
+                .unwrap_or_default();
+            if phase == "Bound" && claim_uid == pvc_ref.uid {
+                if let Some(orig) = &st.original_reclaim_policy {
+                    pv_api
+                        .patch(
+                            &evac.spec.pv_name,
+                            &PatchParams::default(),
+                            &Patch::Merge(
+                                json!({"spec": {"persistentVolumeReclaimPolicy": orig}}),
+                            ),
+                        )
+                        .await?;
+                }
+                tracing::info!(evac = name, "PV swap complete; PVC rebound");
+                advance(ctx, &name, st, Phase::CleaningUp).await
+            } else {
+                Ok(Action::requeue(Duration::from_secs(3)))
+            }
+        }
+    }
+}
+
+fn recovery_cm_name(evac_name: &str) -> String {
+    format!("zevac-rec-{evac_name}")
+}
+
+pub async fn write_recovery_configmap(
+    ctx: &Ctx,
+    evac_name: &str,
+    st: &ZFSEvacuationStatus,
+) -> Result<()> {
+    let api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), &ctx.cfg.pod_namespace);
+    let mut data = std::collections::BTreeMap::new();
+    if let Some(m) = &st.old_pv_manifest {
+        data.insert("oldPV.json".to_string(), m.clone());
+    }
+    if let Some(m) = &st.new_pv_manifest {
+        data.insert("newPV.json".to_string(), m.clone());
+    }
+    let cm = ConfigMap {
+        metadata: ObjectMeta {
+            name: Some(recovery_cm_name(evac_name)),
+            ..Default::default()
+        },
+        data: Some(data),
+        ..Default::default()
+    };
+    let name = recovery_cm_name(evac_name);
+    match api.create(&Default::default(), &cm).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if e.code == 409 => {
+            api.replace(&name, &Default::default(), &{
+                let mut existing = api.get(&name).await?;
+                existing.data = cm.data.clone();
+                existing
+            })
+            .await?;
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub async fn delete_recovery_configmap(ctx: &Ctx, evac_name: &str) -> Result<()> {
+    let api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), &ctx.cfg.pod_namespace);
+    match api
+        .delete(&recovery_cm_name(evac_name), &DeleteParams::default())
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}

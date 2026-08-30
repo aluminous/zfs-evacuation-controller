@@ -1,0 +1,51 @@
+# Attach lock: deny creation of pods that reference a PVC currently under
+# evacuation. CEL cannot look up the PVCs a pod references, so the set of
+# locked PVCs is delivered as a param object (EvacuationParams) maintained by
+# the controller. Covers plain persistentVolumeClaim volumes and generic
+# ephemeral volumes (whose PVC name is derived as <pod>-<volume>), and applies
+# at admission time — so pods that bypass the scheduler via spec.nodeName are
+# blocked too.
+#
+# Requires Kubernetes >= 1.30 (ValidatingAdmissionPolicy GA).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: zfs-evacuation-attach-lock
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  paramKind:
+    apiVersion: zfsevac.io/v1alpha1
+    kind: EvacuationParams
+  variables:
+    - name: lockedKeys
+      expression: "params.spec.pvcKeys"
+  validations:
+    - expression: >-
+        !(has(object.spec.volumes) && object.spec.volumes.exists(v,
+          (has(v.persistentVolumeClaim) &&
+            (object.metadata.namespace + '/' + v.persistentVolumeClaim.claimName) in variables.lockedKeys) ||
+          (has(v.ephemeral) &&
+            (object.metadata.namespace + '/' + object.metadata.name + '-' + v.name) in variables.lockedKeys)))
+      message: >-
+        pod references a PersistentVolumeClaim whose volume is being evacuated
+        to another node by zfs-evacuation-controller; retry after the
+        evacuation completes
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: zfs-evacuation-attach-lock
+spec:
+  policyName: zfs-evacuation-attach-lock
+  validationActions: [Deny]
+  paramRef:
+    name: zfs-evacuation-locks
+    # No locks object yet (or deleted) must not block all pod creation.
+    parameterNotFoundAction: Allow

@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zfs-evacuation-controller
+  namespace: zfs-evacuation-system
+  labels:
+    app: zfs-evacuation-controller
+spec:
+  # Leader election makes >1 replica safe, but 1 is the supported shape:
+  # a follower adds nothing (the relay lives in the leader).
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zfs-evacuation-controller
+  template:
+    metadata:
+      labels:
+        app: zfs-evacuation-controller
+    spec:
+      serviceAccountName: zfs-evacuation-controller
+      # For a private GitLab project, create this secret from a deploy token
+      # with read_registry scope:
+      #   kubectl -n zfs-evacuation-system create secret docker-registry gitlab-registry \
+      #     --docker-server=registry.gitlab.com --docker-username=<token-user> --docker-password=<token>
+      imagePullSecrets:
+        - name: gitlab-registry
+      containers:
+        - name: controller
+          image: registry.gitlab.com/hydrochaeris/zfs-evacuation-controller:latest
+          env:
+            - name: OPENEBS_NAMESPACE
+              value: openebs
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: RUST_LOG
+              value: info,kube=warn
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+---
+# The relay accepts inbound TCP from node agents only (`nc` runs in the
+# host network namespace on each node, so the sources are node addresses).
+# Adjust the CIDRs to your node network.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: zfs-evacuation-relay
+  namespace: zfs-evacuation-system
+spec:
+  podSelector:
+    matchLabels:
+      app: zfs-evacuation-controller
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 10.0.0.0/8 # <- node CIDR, adjust

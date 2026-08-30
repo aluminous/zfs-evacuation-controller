@@ -1,0 +1,103 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zfs-evacuation-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: zfs-evacuation-controller
+  namespace: zfs-evacuation-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: zfs-evacuation-controller
+rules:
+  # PV delete/create is the core of the swap — unavoidably powerful.
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
+  # PVCs: label marker only; never deleted.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["zfsevac.io"]
+    resources: ["zfsevacuations", "zfsevacuations/status", "evacuationparams"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+# zfs-localpv CRs live in the openebs namespace; scope our write access there.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: zfs-evacuation-controller
+  namespace: openebs
+rules:
+  - apiGroups: ["zfs.openebs.io"]
+    resources:
+      ["zfsvolumes", "zfssnapshots", "zfsbackups", "zfsrestores", "zfsnodes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: zfs-evacuation-controller
+  namespace: zfs-evacuation-system
+rules:
+  # Recovery ConfigMaps + leader-election Lease.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: zfs-evacuation-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: zfs-evacuation-controller
+subjects:
+  - kind: ServiceAccount
+    name: zfs-evacuation-controller
+    namespace: zfs-evacuation-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: zfs-evacuation-controller
+  namespace: openebs
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: zfs-evacuation-controller
+subjects:
+  - kind: ServiceAccount
+    name: zfs-evacuation-controller
+    namespace: zfs-evacuation-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: zfs-evacuation-controller
+  namespace: zfs-evacuation-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: zfs-evacuation-controller
+subjects:
+  - kind: ServiceAccount
+    name: zfs-evacuation-controller
+    namespace: zfs-evacuation-system
