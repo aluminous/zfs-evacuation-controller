@@ -583,7 +583,14 @@ async fn transferring(
         return retry_or_fail(ctx, evac, st, &t, max_attempts, "controller restarted mid-transfer")
             .await;
     };
-    if mem_attempt != t.attempt {
+    // Reconciles can carry a STALE cached status (an event older than our own
+    // last write). A live relay newer than the status view must never be
+    // killed — that cascades into burning every attempt. Only a relay OLDER
+    // than the recorded attempt is stale and safe to drop.
+    if mem_attempt > t.attempt {
+        return Ok(Action::requeue(Duration::from_secs(2)));
+    }
+    if mem_attempt < t.attempt {
         drop_relay(ctx, &name);
         return Ok(Action::requeue(Duration::from_secs(1)));
     }
@@ -713,6 +720,16 @@ async fn start_attempt(
     let source = st.source.clone().ok_or_else(|| anyhow!("no source recorded"))?;
     let target = st.target.clone().ok_or_else(|| anyhow!("no target recorded"))?;
 
+    // Idempotent re-entry: a stale-status reconcile can land here for an
+    // attempt that is already running — never respawn over a live relay.
+    {
+        let map = ctx.transfers.lock().unwrap();
+        if let Some(existing) = map.get(&name)
+            && existing.attempt >= attempt {
+                return Ok(Action::requeue(Duration::from_secs(5)));
+            }
+    }
+
     let src_node = node_by_id(&ctx.nodes(), &source.node_id)
         .await?
         .ok_or_else(|| anyhow!("source node {} gone", source.node_id))?;
@@ -799,16 +816,23 @@ async fn start_attempt(
 /// addresses (agents on hostNetwork, or SNAT'd egress) plus the IPs of pods
 /// in the openebs namespace running on that node (agents on the pod network
 /// whose CNI preserves source IPs).
-async fn relay_peers(ctx: &Ctx, node: &k8s_openapi::api::core::v1::Node) -> Result<Vec<std::net::IpAddr>> {
-    let mut peers = node_ips(node);
-    let pods = ctx
-        .pods(&ctx.cfg.openebs_ns)
-        .list(&ListParams::default().fields(&format!("spec.nodeName={}", node.name_any())))
-        .await?;
-    for pod in pods {
-        if let Some(ips) = pod.status.as_ref().and_then(|s| s.pod_ips.as_ref()) {
-            peers.extend(ips.iter().filter_map(|p| p.ip.parse::<std::net::IpAddr>().ok()));
-        }
+async fn relay_peers(
+    _ctx: &Ctx,
+    node: &k8s_openapi::api::core::v1::Node,
+) -> Result<Vec<crate::transfer::relay::IpNet>> {
+    use crate::transfer::relay::IpNet;
+    // Node addresses cover hostNetwork agents and SNAT'd egress; the node's
+    // pod CIDR(s) cover agents on the pod network AND the CNI gateway address
+    // the traffic can be masqueraded to when crossing nodes (observed in
+    // practice: flannel presents <podCIDR>.1 as the source).
+    let mut peers: Vec<IpNet> = node_ips(node).into_iter().map(IpNet::host).collect();
+    if let Some(spec) = node.spec.as_ref() {
+        let mut cidrs: Vec<String> = spec.pod_cidrs.clone().unwrap_or_default();
+        if let Some(c) = spec.pod_cidr.clone()
+            && !cidrs.contains(&c) {
+                cidrs.push(c);
+            }
+        peers.extend(cidrs.iter().filter_map(|c| IpNet::parse_cidr(c)));
     }
     if peers.is_empty() {
         return Err(anyhow!("no relay peer addresses found for node {}", node.name_any()));

@@ -16,6 +16,43 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
+/// A network in CIDR terms; hosts are a /32 (or /128). Local, tiny — not
+/// worth a dependency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IpNet {
+    pub addr: IpAddr,
+    pub prefix: u8,
+}
+
+impl IpNet {
+    pub fn host(addr: IpAddr) -> IpNet {
+        let prefix = if addr.is_ipv4() { 32 } else { 128 };
+        IpNet { addr, prefix }
+    }
+
+    pub fn parse_cidr(s: &str) -> Option<IpNet> {
+        let (ip, len) = s.split_once('/')?;
+        let addr: IpAddr = ip.trim().parse().ok()?;
+        let prefix: u8 = len.trim().parse().ok()?;
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        (prefix <= max).then_some(IpNet { addr, prefix })
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                let mask = if self.prefix == 0 { 0 } else { u32::MAX << (32 - self.prefix as u32) };
+                u32::from(net) & mask == u32::from(ip) & mask
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                let mask = if self.prefix == 0 { 0 } else { u128::MAX << (128 - self.prefix as u32) };
+                u128::from(net) & mask == u128::from(ip) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
 pub struct Relay {
     pub backup_port: u16,
     pub restore_port: u16,
@@ -30,7 +67,7 @@ impl Relay {
     /// Bind both listeners (ephemeral ports) and start the splice task.
     /// `backup_peers`/`restore_peers` are the source/target node IPs allowed
     /// to connect to the respective port.
-    pub async fn spawn(backup_peers: Vec<IpAddr>, restore_peers: Vec<IpAddr>) -> Result<Relay> {
+    pub async fn spawn(backup_peers: Vec<IpNet>, restore_peers: Vec<IpNet>) -> Result<Relay> {
         let backup_listener = TcpListener::bind(("0.0.0.0", 0))
             .await
             .context("bind backup listener")?;
@@ -78,7 +115,7 @@ fn now_secs() -> u64 {
 /// as the matching peer connects (single-accept).
 async fn accept_from(
     listener: TcpListener,
-    allowed: &[IpAddr],
+    allowed: &[IpNet],
     role: &str,
     last_activity: &AtomicU64,
 ) -> Result<TcpStream> {
@@ -86,7 +123,7 @@ async fn accept_from(
         let (stream, peer): (TcpStream, SocketAddr) = listener.accept().await?;
         // An empty allowlist rejects everyone (fail closed) — callers must
         // resolve real peer addresses before spawning the relay.
-        if allowed.contains(&peer.ip()) {
+        if allowed.iter().any(|net| net.contains(peer.ip())) {
             tracing::info!(%peer, role, "relay accepted connection");
             last_activity.store(now_secs(), Ordering::Relaxed);
             return Ok(stream);

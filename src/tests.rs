@@ -120,6 +120,23 @@ fn new_pv_rendering() {
 }
 
 #[test]
+fn ipnet_matching() {
+    use crate::transfer::relay::IpNet;
+    let node = IpNet::host("100.71.177.44".parse().unwrap());
+    assert!(node.contains("100.71.177.44".parse().unwrap()));
+    assert!(!node.contains("100.71.177.45".parse().unwrap()));
+
+    let pod_cidr = IpNet::parse_cidr("10.42.1.0/24").unwrap();
+    // The flannel gateway address that bit us in production testing.
+    assert!(pod_cidr.contains("10.42.1.1".parse().unwrap()));
+    assert!(pod_cidr.contains("10.42.1.254".parse().unwrap()));
+    assert!(!pod_cidr.contains("10.42.2.1".parse().unwrap()));
+
+    assert!(IpNet::parse_cidr("10.42.1.0/33").is_none());
+    assert!(IpNet::parse_cidr("garbage").is_none());
+}
+
+#[test]
 fn crd_generation_is_valid() {
     use kube::CustomResourceExt;
     let crd = crate::crd::zfs_evacuation::ZFSEvacuation::crd();
