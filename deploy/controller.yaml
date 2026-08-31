@@ -49,6 +49,10 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             runAsNonRoot: true
+            # Numeric ids so kubelet can verify runAsNonRoot regardless of
+            # the image's USER form.
+            runAsUser: 65532
+            runAsGroup: 65532
             capabilities:
               drop: ["ALL"]
 ---

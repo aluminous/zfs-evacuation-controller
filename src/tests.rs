@@ -158,6 +158,33 @@ fn taint_matching() {
 }
 
 #[test]
+fn pool_component_matching() {
+    use crate::controller::target::pool_component;
+    // ZFSNode inventories bare zpools; a dataset-path poolname must be
+    // eligible via its zpool component (the exact-string compare used to
+    // wedge TargetSelecting forever, including with spec.targetNode set).
+    assert_eq!(pool_component("zroot"), "zroot");
+    assert_eq!(pool_component("zroot/csi"), "zroot");
+    assert_eq!(pool_component("zroot/csi/deep"), "zroot");
+    assert_eq!(pool_component(""), "");
+}
+
+#[test]
+fn destination_poolname_resolution() {
+    use crate::controller::target::resolve_dest_poolname;
+    // 1. Explicit targetPool wins verbatim.
+    let (d, r) = resolve_dest_poolname(Some("tank/override"), Some("zroot/csi"), "zroot/csi");
+    assert_eq!((d.as_str(), r), ("tank/override", "spec.targetPool"));
+    // 2. StorageClass poolname: what provisioning on the target would use.
+    let (d, r) = resolve_dest_poolname(None, Some("zroot/csi"), "zroot/old");
+    assert_eq!((d.as_str(), r), ("zroot/csi", "StorageClass poolname"));
+    // 3. SC gone: carry the source poolName over unchanged.
+    let (d, r) = resolve_dest_poolname(None, None, "zroot/legacy");
+    assert_eq!(d.as_str(), "zroot/legacy");
+    assert!(r.contains("source poolName"));
+}
+
+#[test]
 fn crd_generation_is_valid() {
     use kube::CustomResourceExt;
     let crd = crate::crd::zfs_evacuation::ZFSEvacuation::crd();

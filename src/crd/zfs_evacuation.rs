@@ -44,7 +44,9 @@ pub struct ZFSEvacuationSpec {
     /// Optional explicit target node (else auto-selected).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_node: Option<String>,
-    /// Optional explicit target pool (else same pool name as source).
+    /// Optional explicit destination poolname, verbatim — may be a dataset
+    /// path ("zroot/csi"). Default: the PV's StorageClass `poolname`
+    /// parameter, else the source volume's poolName carried over.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_pool: Option<String>,
     /// Seconds to wait after the last pod disappears before snapshotting
@@ -115,6 +117,8 @@ pub struct SourceInfo {
 pub struct TargetInfo {
     pub node: String,
     pub node_id: String,
+    /// Full destination poolname (may be a dataset path): becomes the new
+    /// ZFSVolume's poolName. Capacity accounting uses its zpool component.
     pub pool: String,
     pub new_volume_handle: String,
 }

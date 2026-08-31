@@ -17,5 +17,7 @@ RUN cargo build --release --target x86_64-unknown-linux-gnu
 
 FROM --platform=linux/amd64 gcr.io/distroless/cc-debian13:nonroot
 COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/zfs-evacuation-controller /usr/local/bin/zfs-evacuation-controller
-USER nonroot
+# Numeric, so kubelet can verify runAsNonRoot (the string "nonroot" fails
+# with CreateContainerConfigError under runAsNonRoot: true).
+USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/zfs-evacuation-controller"]

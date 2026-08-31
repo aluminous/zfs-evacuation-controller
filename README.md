@@ -76,8 +76,16 @@ corresponding external mutation.
 Refused up front: volumes with ZFSSnapshots, clones, `marked-for-deletion`,
 or an in-flight resize; volumes whose source node is already gone (the data
 is unreachable — restore from backup instead). One transfer per source and
-per target node at a time; full (non-incremental) send per attempt; same pool
-name on the target by default.
+per target node at a time; full (non-incremental) send per attempt.
+
+Destination poolname: `spec.targetPool` verbatim if set; else the PV's
+StorageClass `poolname` parameter (what provisioning on the target would
+have used); else the source volume's poolName carried over. Poolnames may be
+dataset paths ("zroot/csi") — target eligibility and capacity are judged on
+the zpool component, and if the parent dataset of the destination does not
+exist on the target, the restore fails there: provisioning parent datasets
+on every node is the operator's contract (the controller is unprivileged and
+cannot create or probe them).
 
 Cancel semantics per trigger: annotation evacuations cancel when the
 annotation is removed; taint evacuations cancel when the source node's taint

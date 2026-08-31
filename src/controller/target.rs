@@ -23,17 +23,55 @@ pub struct SelectionInput<'a> {
     pub pv: &'a PersistentVolume,
 }
 
+/// A zfs-localpv poolname may be a dataset path ("zroot/csi"). Only its
+/// first component names a zpool; ZFSNode inventories (and capacity) are
+/// per-zpool, so eligibility must compare components while the full path
+/// stays the receive location.
+pub fn pool_component(poolname: &str) -> &str {
+    poolname.split('/').next().unwrap_or(poolname)
+}
+
+/// Where the received dataset goes (the new ZFSVolume's poolName), in
+/// priority order — none of which encodes any site naming convention:
+///  1. spec.targetPool verbatim (operator override);
+///  2. the PV's StorageClass `poolname` parameter: by definition what
+///     provisioning this PVC on the target node would have used;
+///  3. the source volume's poolName carried over (SC gone or missing the
+///     parameter).
+/// Returns the destination and which rule picked it (for logging).
+pub fn resolve_dest_poolname(
+    target_pool: Option<&str>,
+    sc_poolname: Option<&str>,
+    source_pool: &str,
+) -> (String, &'static str) {
+    if let Some(tp) = target_pool {
+        return (tp.to_string(), "spec.targetPool");
+    }
+    if let Some(sc) = sc_poolname {
+        return (sc.to_string(), "StorageClass poolname");
+    }
+    (source_pool.to_string(), "source poolName (StorageClass unavailable)")
+}
+
 pub async fn select_target(ctx: &Ctx, input: &SelectionInput<'_>) -> Result<TargetInfo> {
     let zfsnodes: Api<ZFSNode> = ctx.openebs();
     let nodes = ctx.nodes().list(&ListParams::default()).await?;
     let evacs: Api<ZFSEvacuation> = Api::all(ctx.client.clone());
     let all_evacs = evacs.list(&ListParams::default()).await?;
 
-    let wanted_pool = input
-        .spec
-        .target_pool
-        .clone()
-        .unwrap_or_else(|| input.source_pool.to_string());
+    let sc_pool = sc_poolname(ctx, input.pv).await?;
+    let (dest_pool, dest_rule) = resolve_dest_poolname(
+        input.spec.target_pool.as_deref(),
+        sc_pool.as_deref(),
+        input.source_pool,
+    );
+    let wanted_component = pool_component(&dest_pool).to_string();
+    tracing::info!(
+        evac = input.evac_name,
+        dest = %dest_pool,
+        rule = dest_rule,
+        "destination poolname resolved"
+    );
     let headroom = input
         .spec
         .headroom_percent
@@ -54,9 +92,11 @@ pub async fn select_target(ctx: &Ctx, input: &SelectionInput<'_>) -> Result<Targ
         }
         if let Some(t) = &st.target {
             busy_targets.insert(t.node_id.clone());
-            // Reserve the evacuating volume's capacity against the target pool.
+            // Reserve the evacuating volume's capacity against the target's
+            // zpool. status.target.pool may be a dataset path; capacity is a
+            // per-zpool quantity, so the ledger keys on the pool component.
             *reserved
-                .entry((t.node_id.clone(), t.pool.clone()))
+                .entry((t.node_id.clone(), pool_component(&t.pool).to_string()))
                 .or_default() += capacity_of_evac(e);
         }
     }
@@ -100,7 +140,9 @@ pub async fn select_target(ctx: &Ctx, input: &SelectionInput<'_>) -> Result<Targ
             continue;
         }
         for pool in &zn.pools {
-            if pool.name != wanted_pool {
+            // ZFSNode reports bare zpool names; the destination may be a
+            // dataset path within one. Eligibility is a zpool property.
+            if pool.name != wanted_component {
                 continue;
             }
             let free = pool
@@ -120,10 +162,10 @@ pub async fn select_target(ctx: &Ctx, input: &SelectionInput<'_>) -> Result<Targ
 
     // Most free space first.
     candidates.sort_by_key(|c| std::cmp::Reverse(c.3));
-    let (node, node_id, pool, _) = candidates.into_iter().next().ok_or_else(|| {
+    let (node, node_id, _, _) = candidates.into_iter().next().ok_or_else(|| {
         anyhow!(
-            "no eligible target: need {need} bytes in pool {wanted_pool} on a ready node \
-             (excluding source {})",
+            "no eligible target: need {need} bytes in zpool {wanted_component} \
+             (for destination {dest_pool}) on a ready node (excluding source {})",
             input.source_node_id
         )
     })?;
@@ -131,9 +173,24 @@ pub async fn select_target(ctx: &Ctx, input: &SelectionInput<'_>) -> Result<Targ
     Ok(TargetInfo {
         node,
         node_id,
-        pool,
+        // The full destination poolname: becomes the new ZFSVolume's
+        // poolName, i.e. the parent the target agent receives into.
+        pool: dest_pool,
         new_volume_handle: String::new(), // filled by caller
     })
+}
+
+/// The PV's StorageClass `poolname` parameter, if the SC still exists and
+/// carries one.
+async fn sc_poolname(ctx: &Ctx, pv: &PersistentVolume) -> Result<Option<String>> {
+    let Some(sc_name) = pv.spec.as_ref().and_then(|s| s.storage_class_name.clone()) else {
+        return Ok(None);
+    };
+    let scs: Api<StorageClass> = Api::all(ctx.client.clone());
+    let Some(sc) = scs.get_opt(&sc_name).await? else {
+        return Ok(None);
+    };
+    Ok(sc.parameters.and_then(|p| p.get("poolname").cloned()))
 }
 
 fn capacity_of_evac(e: &ZFSEvacuation) -> u128 {
