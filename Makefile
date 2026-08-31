@@ -1,4 +1,4 @@
-IMAGE ?= registry.gitlab.com/hydrochaeris/zfs-evacuation-controller:latest
+IMAGE ?= ghcr.io/aluminous/zfs-evacuation-controller:latest
 DOCKER ?= podman
 
 .PHONY: test check crds image deploy

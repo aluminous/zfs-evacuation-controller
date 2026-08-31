@@ -18,15 +18,10 @@ spec:
         app: zfs-evacuation-controller
     spec:
       serviceAccountName: zfs-evacuation-controller
-      # For a private GitLab project, create this secret from a deploy token
-      # with read_registry scope:
-      #   kubectl -n zfs-evacuation-system create secret docker-registry gitlab-registry \
-      #     --docker-server=registry.gitlab.com --docker-username=<token-user> --docker-password=<token>
-      imagePullSecrets:
-        - name: gitlab-registry
+      # The image on ghcr.io is public; no pull secret needed.
       containers:
         - name: controller
-          image: registry.gitlab.com/hydrochaeris/zfs-evacuation-controller:latest
+          image: ghcr.io/aluminous/zfs-evacuation-controller:latest
           env:
             - name: OPENEBS_NAMESPACE
               value: openebs

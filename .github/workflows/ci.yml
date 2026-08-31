@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - run: cargo test --locked
+      - run: cargo clippy --locked -- -D warnings
+
+  # Runners are amd64, matching the cluster; the Dockerfile's cross-toolchain
+  # stage degrades to a native build there.
+  image:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        run: |
+          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-8)
+          docker build --platform=linux/amd64 \
+            -t "$IMAGE:$SHORT_SHA" -t "$IMAGE:latest" .
+          docker push "$IMAGE:$SHORT_SHA"
+          docker push "$IMAGE:latest"
