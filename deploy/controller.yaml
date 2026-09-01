@@ -55,21 +55,3 @@ spec:
             runAsGroup: 65532
             capabilities:
               drop: ["ALL"]
----
-# The relay accepts inbound TCP from node agents only (`nc` runs in the
-# host network namespace on each node, so the sources are node addresses).
-# Adjust the CIDRs to your node network.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: zfs-evacuation-relay
-  namespace: zfs-evacuation-system
-spec:
-  podSelector:
-    matchLabels:
-      app: zfs-evacuation-controller
-  policyTypes: [Ingress]
-  ingress:
-    - from:
-        - ipBlock:
-            cidr: 10.0.0.0/8 # <- node CIDR, adjust

@@ -102,8 +102,13 @@ is removed (a *deleted* node is not a cancel). The taint key defaults to
 - Quiescence is "no pod objects + settle period" (default 90 s): the guarantee
   is crash-consistency in the worst case; the VAP lock prevents any writer
   from re-attaching mid-copy.
-- The relay is cleartext TCP pinned to node IPs with single-accept listeners;
-  apply the NetworkPolicy in `deploy/controller.yaml` (adjust the node CIDR).
+- The relay is cleartext TCP; its access control is the runtime peer
+  allowlist, derived live from the Node objects (node addresses + pod CIDRs),
+  scoped per attempt to the two expected nodes, single-accept, on random
+  ports. There is deliberately no shipped NetworkPolicy: it would hardcode
+  site CIDRs into a manifest and add nothing the pinning doesn't already do
+  more precisely. zfs send streams are internally checksummed; recv fails
+  loudly on corruption.
 - If a node is deleted while CRs still reference it, the controller strips
   the stuck `zfs.openebs.io/finalizer` itself — the disk left with the node.
 
