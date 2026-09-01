@@ -43,17 +43,29 @@ and everything referencing it — is untouched.
 kubectl apply -f deploy/crds.yaml -f deploy/rbac.yaml \
   -f deploy/admission.yaml -f deploy/controller.yaml
 
-# Trigger 1: annotate a PV. Evacuation starts once no pod uses it.
+# Trigger 1: annotate a PV to evacuate that one volume.
 kubectl annotate pv pvc-1234... zfsevac.alumino.us/evacuate=true
 
 # Trigger 2: taint a node (any effect) to evacuate ALL its zfs-localpv
-# volumes as each becomes unused. Nothing is evicted — drain pods yourself
-# (or let workloads finish); each volume migrates when its PVC is idle.
-# A tainted node is also excluded as an evacuation target.
+# volumes. A tainted node is also excluded as an evacuation target.
 kubectl taint node worker-3 zfsevac.alumino.us/evacuate=:PreferNoSchedule
 
 kubectl get zfsevacuations        # short name: zevac
 ```
+
+Both triggers **lock the PVC immediately** (attach lock, see above), in use
+or not, and the transfer starts once the last pod referencing it is gone.
+Nothing is evicted by the controller — drain the node yourself, or let the
+workload finish. The order matters: trigger first, evict second. With the
+lock armed before eviction, a Deployment/StatefulSet's replacement pod is
+denied at creation and the controller simply retries until the volume has
+moved, at which point the pod lands on the new node. Evicting *before* the
+lock exists lets that replacement be created as a never-scheduled pod pinned
+to the source node by PV affinity; a creation-time policy cannot touch it and
+the evacuation reports it in `status.message` — delete the pod (its
+recreation is denied) and the evacuation proceeds. Do not trigger what you
+do not intend to drain: while the lock holds, a crashed consumer cannot
+restart until the migration completes.
 
 Cancel by removing the annotation or deleting the ZFSEvacuation — honored any
 time before the commit point (the old-PV delete); after that the machine rolls

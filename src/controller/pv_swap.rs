@@ -47,7 +47,10 @@ pub async fn committing(
         // Should be impossible with the VAP lock; abort loudly rather than
         // swap under a live consumer.
         st.phase = Phase::Aborting;
-        st.message = Some(format!("pods appeared at commit despite lock: {}", pods.join(", ")));
+        st.message = Some(format!(
+            "pods appeared at commit despite lock: {}",
+            crate::controller::pod_names(&pods).join(", ")
+        ));
         ctx.write_status(&name, st).await?;
         return Ok(Action::requeue(Duration::from_secs(1)));
     }

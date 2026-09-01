@@ -193,3 +193,58 @@ fn crd_generation_is_valid() {
     let crd = crate::crd::zfs_evacuation::EvacuationParams::crd();
     assert_eq!(crd.spec.names.kind, "EvacuationParams");
 }
+
+#[test]
+fn pod_scheduling_predicate() {
+    use crate::controller::pod_is_scheduled;
+    use k8s_openapi::api::core::v1::Pod;
+
+    let scheduled: Pod = from_value(json!({
+        "metadata": {"name": "app-0"},
+        "spec": {"nodeName": "worker-1"}
+    }))
+    .unwrap();
+    assert!(pod_is_scheduled(&scheduled));
+
+    let pending: Pod = from_value(json!({"metadata": {"name": "app-1"}, "spec": {}})).unwrap();
+    assert!(!pod_is_scheduled(&pending));
+
+    let empty: Pod =
+        from_value(json!({"metadata": {"name": "app-2"}, "spec": {"nodeName": ""}})).unwrap();
+    assert!(!pod_is_scheduled(&empty));
+}
+
+#[test]
+fn blocking_pods_message_separates_remedies() {
+    use crate::controller::blocking_pods_message;
+    use k8s_openapi::api::core::v1::Pod;
+
+    let running: Pod = from_value(json!({
+        "metadata": {"name": "running-consumer"},
+        "spec": {"nodeName": "worker-1"}
+    }))
+    .unwrap();
+    let stranded: Pod =
+        from_value(json!({"metadata": {"name": "stranded-replacement"}, "spec": {}})).unwrap();
+
+    let msg = blocking_pods_message(&[running.clone()]);
+    assert_eq!(msg, "waiting for pods to release PVC: running-consumer");
+
+    // A never-scheduled pod predates the lock; the only remedy is deletion,
+    // and the message must say so rather than imply it will drain away.
+    let msg = blocking_pods_message(&[stranded.clone()]);
+    assert!(
+        msg.starts_with("never-scheduled pods predate the lock"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("stranded-replacement") && msg.contains("delete them"),
+        "{msg}"
+    );
+
+    let msg = blocking_pods_message(&[running, stranded]);
+    assert!(
+        msg.contains("running-consumer") && msg.contains("stranded-replacement"),
+        "{msg}"
+    );
+}

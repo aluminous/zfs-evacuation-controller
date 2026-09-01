@@ -399,23 +399,12 @@ async fn locking(
 ) -> Result<Action> {
     let name = evac.name_any();
     let pvc_ref = st.pvc_ref.clone().ok_or_else(|| anyhow!("no pvcRef recorded"))?;
-    // Taint-triggered evacuations sweep a whole node, so they must be gentle:
-    // never lock a PVC that pods are still using (the VAP would block a
-    // crashed pod from restarting mid-drain). Annotation evacuations lock
-    // immediately — the user singled out that volume deliberately.
-    if evac.spec.trigger == crate::crd::zfs_evacuation::EvacuationTrigger::NodeTaint {
-        let pods = pods_referencing_pvc(&ctx.pods(&pvc_ref.namespace), &pvc_ref.name).await?;
-        if !pods.is_empty() {
-            return wait(
-                ctx,
-                &name,
-                st,
-                format!("taint trigger: waiting for PVC to be idle before locking ({})", pods.join(", ")),
-                30,
-            )
-            .await;
-        }
-    }
+    // Both triggers lock immediately, in-use or not. Locking before the
+    // consumer is evicted is what makes a drain safe: the workload
+    // controller's replacement pod is denied at creation instead of landing as a
+    // never-scheduled pod pinned to the source node by PV affinity — one no
+    // creation-time policy can touch, and one that holds Quiescing forever.
+    // Consequence: taint (or annotate) only what you are about to drain.
     let key = format!("{}/{}", pvc_ref.namespace, pvc_ref.name);
     ctx.update_params(|keys| {
         if keys.contains(&key) {
@@ -457,39 +446,15 @@ async fn quiescing(
     let pods = pods_referencing_pvc(&ctx.pods(&pvc_ref.namespace), &pvc_ref.name).await?;
     if !pods.is_empty() {
         st.quiesced_at = None;
-        // Taint-triggered: a pod that raced the lock (created in the VAP
-        // propagation window) may be long-running; holding the lock would
-        // block its restarts. Unlock and fall back to Locking's idle-wait.
-        if evac.spec.trigger == crate::crd::zfs_evacuation::EvacuationTrigger::NodeTaint {
-            let key = format!("{}/{}", pvc_ref.namespace, pvc_ref.name);
-            ctx.update_params(|keys| {
-                let before = keys.len();
-                keys.retain(|k| k != &key);
-                keys.len() != before
-            })
-            .await?;
-            let _ = ctx
-                .pvcs(&pvc_ref.namespace)
-                .patch(
-                    &pvc_ref.name,
-                    &PatchParams::default(),
-                    &Patch::Merge(json!({"metadata": {"labels": {EVACUATING_LABEL: null}}})),
-                )
-                .await;
-            st.locked_at = None;
-            st.message = Some(format!(
-                "unlocked: pods appeared before quiesce ({})",
-                pods.join(", ")
-            ));
-            st.phase = Phase::Locking;
-            ctx.write_status(&name, st).await?;
-            return Ok(Action::requeue(Duration::from_secs(30)));
-        }
+        // Strict: any pod object referencing the PVC blocks, scheduled or
+        // not. The message distinguishes them because the remedies differ —
+        // a scheduled consumer has to exit (drain it); a never-scheduled one
+        // predates the lock and only goes away by deletion.
         return wait(
             ctx,
             &name,
             st,
-            format!("waiting for pods to release PVC: {}", pods.join(", ")),
+            crate::controller::blocking_pods_message(&pods),
             15,
         )
         .await;

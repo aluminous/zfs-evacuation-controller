@@ -3,8 +3,9 @@
 //!
 //! - Phase 1: a PV annotated `zfsevac.alumino.us/evacuate=true`.
 //! - Phase 2: a node tainted with the evacuate taint key — every zfs-localpv
-//!   volume owned by that node is evacuated (each one waiting, as always, for
-//!   its PVC to be unused; running pods are never disturbed or evicted).
+//!   volume owned by that node is evacuated. Both triggers lock the PVC
+//!   immediately; the transfer waits for its last pod to go. Nothing is
+//!   evicted here: draining is the operator's move, made after the lock.
 //!
 //! A periodic list (not a watch): a pure watcher misses the "ZFSEvacuation
 //! was deleted while the trigger condition remains" case — no event fires, so
@@ -21,7 +22,7 @@ use kube::ResourceExt;
 use crate::controller::{node_has_evacuate_taint, node_id_of, Ctx};
 use crate::crd::openebs::{ZFSVolume, ZFS_DRIVER};
 use crate::crd::zfs_evacuation::{
-    EvacuationTrigger, ZFSEvacuation, ZFSEvacuationSpec, EVACUATE_ANNOTATION,
+    EvacuationTrigger, Phase, ZFSEvacuation, ZFSEvacuationSpec, EVACUATE_ANNOTATION,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(15);
@@ -99,29 +100,51 @@ fn wants_evacuation(pv: &PersistentVolume) -> bool {
 async fn ensure_evacuation(ctx: &Ctx, pv_name: &str, trigger: EvacuationTrigger) {
     let api: Api<ZFSEvacuation> = Api::all(ctx.client.clone());
     match api.get_opt(pv_name).await {
-        Ok(Some(_)) => {} // exists (any phase) — deleting it is the retry gesture
-        Ok(None) => {
-            let evac = ZFSEvacuation::new(
-                pv_name,
-                ZFSEvacuationSpec {
-                    pv_name: pv_name.to_string(),
-                    trigger: trigger.clone(),
-                    target_node: None,
-                    target_pool: None,
-                    settle_seconds: None,
-                    transfer_timeout_seconds: None,
-                    max_attempts: None,
-                    headroom_percent: None,
-                },
-            );
-            match api.create(&Default::default(), &evac).await {
-                Ok(_) => tracing::info!(pv = pv_name, ?trigger, "created ZFSEvacuation"),
-                Err(kube::Error::Api(e)) if e.code == 409 => {}
+        Ok(Some(existing)) => {
+            // A Completed CR is a finished job keeping the per-PV name: the
+            // trigger firing again (the volume's new node tainted, a fresh
+            // annotation) is a new request, so replace it. Failed stays put —
+            // deleting it is the operator's retry gesture, and it must stay
+            // visible until then.
+            let done = existing
+                .status
+                .as_ref()
+                .is_some_and(|s| matches!(s.phase, Phase::Completed));
+            if !done {
+                return;
+            }
+            match api.delete(pv_name, &Default::default()).await {
+                Ok(_) => tracing::info!(pv = pv_name, "replaced Completed ZFSEvacuation"),
+                Err(kube::Error::Api(e)) if e.code == 404 => {}
                 Err(e) => {
-                    tracing::warn!(pv = pv_name, error = %e, "failed to create ZFSEvacuation")
+                    tracing::warn!(pv = pv_name, error = %e, "failed to delete Completed ZFSEvacuation");
+                    return;
                 }
             }
+            create_evacuation(&api, pv_name, trigger).await;
         }
+        Ok(None) => create_evacuation(&api, pv_name, trigger).await,
         Err(e) => tracing::warn!(pv = pv_name, error = %e, "failed to check ZFSEvacuation"),
+    }
+}
+
+async fn create_evacuation(api: &Api<ZFSEvacuation>, pv_name: &str, trigger: EvacuationTrigger) {
+    let evac = ZFSEvacuation::new(
+        pv_name,
+        ZFSEvacuationSpec {
+            pv_name: pv_name.to_string(),
+            trigger: trigger.clone(),
+            target_node: None,
+            target_pool: None,
+            settle_seconds: None,
+            transfer_timeout_seconds: None,
+            max_attempts: None,
+            headroom_percent: None,
+        },
+    );
+    match api.create(&Default::default(), &evac).await {
+        Ok(_) => tracing::info!(pv = pv_name, ?trigger, "created ZFSEvacuation"),
+        Err(kube::Error::Api(e)) if e.code == 409 => {}
+        Err(e) => tracing::warn!(pv = pv_name, error = %e, "failed to create ZFSEvacuation"),
     }
 }

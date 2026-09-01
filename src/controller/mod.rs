@@ -222,13 +222,48 @@ pub fn pod_references_pvc(pod: &Pod, pvc_name: &str) -> bool {
 
 /// Pods that reference the PVC. Terminating and completed pods count: a pod
 /// object's existence is our only unmount signal.
-pub async fn pods_referencing_pvc(pods: &Api<Pod>, pvc_name: &str) -> Result<Vec<String>> {
+pub async fn pods_referencing_pvc(pods: &Api<Pod>, pvc_name: &str) -> Result<Vec<Pod>> {
     let list = pods.list(&ListParams::default()).await?;
     Ok(list
         .into_iter()
         .filter(|p| pod_references_pvc(p, pvc_name))
-        .map(|p| p.name_any())
         .collect())
+}
+
+/// Has the scheduler bound this pod to a node? A never-scheduled pod holds
+/// no attachment, but it still blocks Quiescing: the strict zero-pods rule
+/// stays, this only lets the status message say which kind is in the way.
+pub fn pod_is_scheduled(pod: &Pod) -> bool {
+    pod.spec
+        .as_ref()
+        .and_then(|s| s.node_name.as_deref())
+        .map(|n| !n.is_empty())
+        .unwrap_or(false)
+}
+
+pub fn pod_names(pods: &[Pod]) -> Vec<String> {
+    pods.iter().map(|p| p.name_any()).collect()
+}
+
+/// Status text for pods blocking a locked PVC. Never-scheduled pods are
+/// called out separately: they predate the lock (the VAP only sees creation),
+/// and deleting them is the fix — the armed lock denies their recreation.
+pub fn blocking_pods_message(pods: &[Pod]) -> String {
+    let (scheduled, unscheduled): (Vec<&Pod>, Vec<&Pod>) =
+        pods.iter().partition(|p| pod_is_scheduled(p));
+    let names = |v: &[&Pod]| v.iter().map(|p| p.name_any()).collect::<Vec<_>>().join(", ");
+    let mut parts = Vec::new();
+    if !scheduled.is_empty() {
+        parts.push(format!("waiting for pods to release PVC: {}", names(&scheduled)));
+    }
+    if !unscheduled.is_empty() {
+        parts.push(format!(
+            "never-scheduled pods predate the lock and hold it open: {} \
+             (delete them; the attach-lock denies recreation until the volume has moved)",
+            names(&unscheduled)
+        ));
+    }
+    parts.join("; ")
 }
 
 /// Parse a Kubernetes resource.Quantity into bytes (decimal + binary suffixes).
