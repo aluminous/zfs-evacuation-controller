@@ -1025,8 +1025,6 @@ async fn cleaning_up(
                 .await?;
         }
 
-    // 5. Recovery ConfigMap.
-    pv_swap::delete_recovery_configmap(ctx, &name).await?;
 
     // Record Completed before dropping our finalizer: if the CR is mid-
     // deletion, the finalizer removal may erase the object immediately and a

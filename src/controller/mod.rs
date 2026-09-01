@@ -41,7 +41,7 @@ pub struct Config {
     pub openebs_ns: String,
     /// Our pod IP — advertised to the node agents as the relay address.
     pub pod_ip: String,
-    /// Namespace we run in (recovery ConfigMaps live here).
+    /// Namespace we run in (leader-election Lease lives here).
     pub pod_namespace: String,
     /// Seconds without relay progress before an attempt is declared stalled.
     pub stall_seconds: u64,

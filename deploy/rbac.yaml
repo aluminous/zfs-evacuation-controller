@@ -53,10 +53,7 @@ metadata:
   name: zfs-evacuation-controller
   namespace: zfs-evacuation-system
 rules:
-  # Recovery ConfigMaps + leader-election Lease.
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["get", "list", "watch", "create", "update", "delete"]
+  # Leader-election Lease.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update"]

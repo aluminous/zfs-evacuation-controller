@@ -1,13 +1,13 @@
 //! Commit-point rendering and the PV swap itself. The swap window (old PV
 //! deleted, new PV not yet created) is survivable only because both manifests
-//! are durable in status (and a recovery ConfigMap) before the first delete.
+//! are durable in status before the first delete.
 
 use std::time::Duration;
 
 use anyhow::{anyhow, Context as _, Result};
-use k8s_openapi::api::core::v1::{ConfigMap, ObjectReference, PersistentVolume};
+use k8s_openapi::api::core::v1::{ObjectReference, PersistentVolume};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::api::{Api, DeleteParams, Patch, PatchParams};
+use kube::api::{DeleteParams, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::{Resource, ResourceExt};
 use serde_json::json;
@@ -66,8 +66,10 @@ pub async fn committing(
     st.old_pv_manifest = Some(serde_json::to_string(&old_pv)?);
     st.new_pv_manifest = Some(serde_json::to_string(&new_pv)?);
     st.committed = true;
-    write_recovery_configmap(ctx, &name, st).await?;
-    // The status write below is the commit record; from here, roll forward only.
+    // The status write below is the commit record; from here, roll forward
+    // only. Status in etcd is the sole store: deleting the CR mid-swap runs
+    // the finalizer's roll-forward, and force-stripping the finalizer is an
+    // accepted operator override, not something we insure against.
     advance(ctx, &name, st, Phase::Swapping).await
 }
 
@@ -208,58 +210,5 @@ pub async fn swapping(
                 Ok(Action::requeue(Duration::from_secs(3)))
             }
         }
-    }
-}
-
-fn recovery_cm_name(evac_name: &str) -> String {
-    format!("zevac-rec-{evac_name}")
-}
-
-pub async fn write_recovery_configmap(
-    ctx: &Ctx,
-    evac_name: &str,
-    st: &ZFSEvacuationStatus,
-) -> Result<()> {
-    let api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), &ctx.cfg.pod_namespace);
-    let mut data = std::collections::BTreeMap::new();
-    if let Some(m) = &st.old_pv_manifest {
-        data.insert("oldPV.json".to_string(), m.clone());
-    }
-    if let Some(m) = &st.new_pv_manifest {
-        data.insert("newPV.json".to_string(), m.clone());
-    }
-    let cm = ConfigMap {
-        metadata: ObjectMeta {
-            name: Some(recovery_cm_name(evac_name)),
-            ..Default::default()
-        },
-        data: Some(data),
-        ..Default::default()
-    };
-    let name = recovery_cm_name(evac_name);
-    match api.create(&Default::default(), &cm).await {
-        Ok(_) => Ok(()),
-        Err(kube::Error::Api(e)) if e.code == 409 => {
-            api.replace(&name, &Default::default(), &{
-                let mut existing = api.get(&name).await?;
-                existing.data = cm.data.clone();
-                existing
-            })
-            .await?;
-            Ok(())
-        }
-        Err(e) => Err(e.into()),
-    }
-}
-
-pub async fn delete_recovery_configmap(ctx: &Ctx, evac_name: &str) -> Result<()> {
-    let api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), &ctx.cfg.pod_namespace);
-    match api
-        .delete(&recovery_cm_name(evac_name), &DeleteParams::default())
-        .await
-    {
-        Ok(_) => Ok(()),
-        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
-        Err(e) => Err(e.into()),
     }
 }

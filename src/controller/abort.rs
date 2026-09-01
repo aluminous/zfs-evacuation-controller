@@ -14,7 +14,7 @@ use crate::controller::state_machine::{
     cleanup_transfer_crs, create_if_absent, remove_evac_finalizer, rst_name, set_finalizers,
     strip_zfs_finalizer_if_node_gone,
 };
-use crate::controller::{pv_swap, Ctx};
+use crate::controller::Ctx;
 use crate::crd::openebs::{
     ZFSRestore, ZFSVolume, ZFSVolumeSpec, ZFSVolumeStatus, BKP_STATUS_DONE, ZFS_STATUS_PENDING,
 };
@@ -161,7 +161,6 @@ pub async fn run(
             .await?;
     }
 
-    pv_swap::delete_recovery_configmap(ctx, &name).await?;
 
     let msg = st
         .message

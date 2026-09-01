@@ -29,7 +29,7 @@ and everything referencing it — is untouched.
   `pv-protection` finalizer stripped after quiescence is verified) and
   recreated with the same name and a `claimRef` carrying the PVC's UID — the
   PV controller rebinds the PVC automatically. Both manifests are stored in
-  the ZFSEvacuation status *and* a recovery ConfigMap before the delete, so a
+  the ZFSEvacuation status before the delete, so a
   controller crash mid-swap always resumes.
 - **Safety rails.** The source ZFSVolume gets a guard finalizer (the node
   agent won't destroy while it's present) and the PV is flipped to `Retain`

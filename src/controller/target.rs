@@ -33,11 +33,12 @@ pub fn pool_component(poolname: &str) -> &str {
 
 /// Where the received dataset goes (the new ZFSVolume's poolName), in
 /// priority order — none of which encodes any site naming convention:
-///  1. spec.targetPool verbatim (operator override);
-///  2. the PV's StorageClass `poolname` parameter: by definition what
-///     provisioning this PVC on the target node would have used;
-///  3. the source volume's poolName carried over (SC gone or missing the
-///     parameter).
+/// 1. spec.targetPool verbatim (operator override);
+/// 2. the PV's StorageClass `poolname` parameter: by definition what
+///    provisioning this PVC on the target node would have used;
+/// 3. the source volume's poolName carried over (SC gone or missing the
+///    parameter).
+///
 /// Returns the destination and which rule picked it (for logging).
 pub fn resolve_dest_poolname(
     target_pool: Option<&str>,
