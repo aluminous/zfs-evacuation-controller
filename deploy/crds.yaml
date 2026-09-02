@@ -16,6 +16,9 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
+    - jsonPath: .spec.mode
+      name: Mode
+      type: string
     - jsonPath: .status.target.node
       name: Target
       type: string
@@ -41,6 +44,16 @@ spec:
                 minimum: 0.0
                 nullable: true
                 type: integer
+              mode:
+                default: WhenIdle
+                description: |-
+                  How the consumer gets its volume back; read once, in Locking. The
+                  NodeTaint trigger sets WhenClaimed for volumes a pod references at
+                  trigger time and WhenIdle for the rest; Annotation sets WhenIdle.
+                enum:
+                - WhenIdle
+                - WhenClaimed
+                type: string
               pvName:
                 description: Name of the PV to evacuate (immutable; also the ZFSEvacuation name).
                 type: string
@@ -53,7 +66,10 @@ spec:
                 nullable: true
                 type: integer
               targetNode:
-                description: Optional explicit target node (else auto-selected).
+                description: |-
+                  Optional explicit target node (else auto-selected). Under WhenClaimed
+                  it also anchors the consumer's other volumes: their evacuations
+                  follow it instead of choosing for themselves.
                 nullable: true
                 type: string
               targetPool:
@@ -85,6 +101,47 @@ spec:
           status:
             nullable: true
             properties:
+              colocation:
+                description: |-
+                  WhenClaimed only: the never-scheduled consumer whose volumes are kept
+                  together, and how this evacuation's target was derived from it.
+                nullable: true
+                properties:
+                  followed:
+                    description: 'Follower: the sibling PV whose home decided the target.'
+                    nullable: true
+                    type: string
+                  members:
+                    default: []
+                    description: |-
+                      The group's zfs-localpv volumes still to be moved off the source
+                      (this one included). A Leader reserves their summed capacity on its
+                      target until each member's own evacuation has picked a target.
+                    items:
+                      properties:
+                        capacityBytes:
+                          default: 0
+                          format: uint64
+                          minimum: 0.0
+                          type: integer
+                        pvName:
+                          type: string
+                      required:
+                      - pvName
+                      type: object
+                    type: array
+                  pod:
+                    description: '"namespace/name" of the Pending pod that defined the group.'
+                    type: string
+                  role:
+                    default: Leader
+                    enum:
+                    - Leader
+                    - Follower
+                    type: string
+                required:
+                - pod
+                type: object
               committed:
                 default: false
                 description: Set once the old PV delete has been issued; from here, roll-forward only.
@@ -301,11 +358,23 @@ spec:
           spec:
             description: |-
               Param object for the ValidatingAdmissionPolicy. A single cluster-scoped
-              instance named [`PARAMS_NAME`] holds every PVC currently locked.
+              instance named [`PARAMS_NAME`] holds every PVC currently locked, in the
+              list matching its evacuation's mode.
             properties:
+              claimablePvcKeys:
+                default: []
+                description: |-
+                  "namespace/name" keys of PVCs that new pods may reference as long as
+                  they go through the scheduler (WhenClaimed): pods with spec.nodeName
+                  or a toleration for the cordon taint are denied.
+                items:
+                  type: string
+                type: array
               pvcKeys:
                 default: []
-                description: '"namespace/name" keys of PVCs that must not be referenced by new pods.'
+                description: |-
+                  "namespace/name" keys of PVCs that must not be referenced by new pods
+                  (WhenIdle).
                 items:
                   type: string
                 type: array

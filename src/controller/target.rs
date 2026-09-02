@@ -10,6 +10,7 @@ use kube::ResourceExt;
 
 use crate::crd::openebs::{ZFSNode, NODE_ID_TOPOLOGY_KEY};
 use crate::crd::zfs_evacuation::{Phase, TargetInfo, ZFSEvacuation, ZFSEvacuationSpec};
+use crate::controller::placement::Placement;
 use crate::controller::{
     node_id_of, node_is_ready, parse_quantity_or_bytes, Ctx, DEFAULT_HEADROOM_PERCENT,
 };
@@ -21,6 +22,14 @@ pub struct SelectionInput<'a> {
     pub source_pool: &'a str,
     pub capacity_bytes: u128,
     pub pv: &'a PersistentVolume,
+    /// Co-location: bytes of the group's other unplaced members, carried
+    /// along so the leader's target can take the whole group.
+    pub group_extra_bytes: u128,
+    /// Co-location: a sibling's node (name or id) this volume must follow.
+    /// `spec.targetNode` still wins when both are set.
+    pub anchor: Option<&'a str>,
+    /// Co-location: the consumer's own node constraints.
+    pub placement: Option<&'a Placement>,
 }
 
 /// A zfs-localpv poolname may be a dataset path ("zroot/csi"). Only its
@@ -77,10 +86,16 @@ pub async fn select_target(ctx: &Ctx, input: &SelectionInput<'_>) -> Result<Targ
         .spec
         .headroom_percent
         .unwrap_or(DEFAULT_HEADROOM_PERCENT) as u128;
-    let need = input.capacity_bytes + input.capacity_bytes * headroom / 100;
+    let bytes = input.capacity_bytes + input.group_extra_bytes;
+    let need = bytes + bytes * headroom / 100;
 
     // Reservation ledger + set of nodes already involved in an evacuation
     // (concurrency cap: 1 inbound + 1 outbound per node).
+    let placed: std::collections::HashSet<String> = all_evacs
+        .iter()
+        .filter(|e| e.status.as_ref().is_some_and(|s| s.target.is_some()))
+        .map(|e| e.name_any())
+        .collect();
     let mut reserved: std::collections::HashMap<(String, String), u128> = Default::default();
     let mut busy_targets: std::collections::HashSet<String> = Default::default();
     for e in &all_evacs {
@@ -96,22 +111,38 @@ pub async fn select_target(ctx: &Ctx, input: &SelectionInput<'_>) -> Result<Targ
             // Reserve the evacuating volume's capacity against the target's
             // zpool. status.target.pool may be a dataset path; capacity is a
             // per-zpool quantity, so the ledger keys on the pool component.
-            *reserved
+            let slot = reserved
                 .entry((t.node_id.clone(), pool_component(&t.pool).to_string()))
-                .or_default() += capacity_of_evac(e);
+                .or_default();
+            *slot += capacity_of_evac(e);
+            // A co-location leader also holds its group's unplaced members;
+            // each member's reservation moves to its own evacuation the
+            // moment that one picks a target (and never counts against the
+            // member itself while it is choosing).
+            if let Some(c) = &st.colocation {
+                *slot += c
+                    .members
+                    .iter()
+                    .filter(|m| m.pv_name != e.name_any())
+                    .filter(|m| m.pv_name != input.evac_name && !placed.contains(&m.pv_name))
+                    .map(|m| m.capacity_bytes as u128)
+                    .sum::<u128>();
+            }
         }
     }
 
     // Allowed node ids from the StorageClass topology, if constrained.
     let allowed_ids = allowed_node_ids(ctx, input.pv).await?;
 
+    let explicit = input.spec.target_node.as_deref().or(input.anchor);
     let mut candidates = Vec::new();
+    let mut rejected: Vec<String> = Vec::new();
     for zn in zfsnodes.list(&ListParams::default()).await? {
         let node_id = zn.name_any();
         if node_id == input.source_node_id {
             continue;
         }
-        if let Some(explicit) = &input.spec.target_node {
+        if let Some(explicit) = explicit {
             // Explicit target may be given as node name or node id.
             let matches_explicit = nodes
                 .iter()
@@ -123,29 +154,42 @@ pub async fn select_target(ctx: &Ctx, input: &SelectionInput<'_>) -> Result<Targ
                 continue;
             }
         }
+        let mut reject = |why: String| rejected.push(format!("{node_id}: {why}"));
         if let Some(allowed) = &allowed_ids
             && !allowed.contains(&node_id) {
+                reject("outside the StorageClass allowedTopologies".into());
                 continue;
             }
         let Some(node) = nodes.iter().find(|n| node_id_of(n) == node_id) else {
+            reject("no Node with this openebs.io/nodeid".into());
             continue;
         };
         if !node_is_ready(node) {
+            reject("not Ready or unschedulable".into());
             continue;
         }
         // A node marked for evacuation must never receive evacuated data.
         if crate::controller::node_has_evacuate_taint(node, &ctx.cfg.taint_key) {
+            reject("carries the evacuate taint".into());
             continue;
         }
         if busy_targets.contains(&node_id) {
+            reject("already receiving another evacuation".into());
             continue;
         }
+        if let Some(p) = input.placement
+            && !p.admits(node) {
+                reject("excluded by the consumer pod's nodeSelector/affinity/tolerations".into());
+                continue;
+            }
+        let mut has_pool = false;
         for pool in &zn.pools {
             // ZFSNode reports bare zpool names; the destination may be a
             // dataset path within one. Eligibility is a zpool property.
             if pool.name != wanted_component {
                 continue;
             }
+            has_pool = true;
             let free = pool
                 .free
                 .as_ref()
@@ -157,18 +201,34 @@ pub async fn select_target(ctx: &Ctx, input: &SelectionInput<'_>) -> Result<Targ
                 .unwrap_or(0);
             if free.saturating_sub(res) >= need {
                 candidates.push((node.name_any(), node_id.clone(), pool.name.clone(), free - res));
+            } else {
+                reject(format!(
+                    "zpool {wanted_component} has {} bytes free after reservations, need {need}",
+                    free.saturating_sub(res)
+                ));
             }
+        }
+        if !has_pool {
+            reject(format!("no zpool {wanted_component}"));
         }
     }
 
     // Most free space first.
     candidates.sort_by_key(|c| std::cmp::Reverse(c.3));
     let (node, node_id, _, _) = candidates.into_iter().next().ok_or_else(|| {
-        anyhow!(
-            "no eligible target: need {need} bytes in zpool {wanted_component} \
-             (for destination {dest_pool}) on a ready node (excluding source {})",
-            input.source_node_id
-        )
+        let reasons = if rejected.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", rejected.join(", "))
+        };
+        match explicit {
+            Some(e) => anyhow!("target {e} ineligible (need {need} bytes in zpool {wanted_component}){reasons}"),
+            None => anyhow!(
+                "no eligible target: need {need} bytes in zpool {wanted_component} \
+                 (for destination {dest_pool}) on a ready node (excluding source {}){reasons}",
+                input.source_node_id
+            ),
+        }
     })?;
 
     Ok(TargetInfo {

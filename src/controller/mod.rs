@@ -1,4 +1,6 @@
 pub mod abort;
+pub mod colocation;
+pub mod placement;
 pub mod pv_swap;
 pub mod state_machine;
 pub mod target;
@@ -116,19 +118,19 @@ impl Ctx {
 
     /// Read-modify-write the singleton EvacuationParams (VAP param object)
     /// with conflict retries. `mutate` returns true if a write is needed.
-    pub async fn update_params(&self, mutate: impl Fn(&mut Vec<String>) -> bool) -> Result<()> {
+    pub async fn update_params(
+        &self,
+        mutate: impl Fn(&mut EvacuationParamsSpec) -> bool,
+    ) -> Result<()> {
         let api: Api<EvacuationParams> = Api::all(self.client.clone());
         for _ in 0..8 {
             match api.get_opt(PARAMS_NAME).await? {
                 None => {
-                    let mut keys = Vec::new();
-                    if !mutate(&mut keys) {
+                    let mut spec = EvacuationParamsSpec::default();
+                    if !mutate(&mut spec) {
                         return Ok(());
                     }
-                    let params = EvacuationParams::new(
-                        PARAMS_NAME,
-                        EvacuationParamsSpec { pvc_keys: keys },
-                    );
+                    let params = EvacuationParams::new(PARAMS_NAME, spec);
                     match api.create(&Default::default(), &params).await {
                         Ok(_) => return Ok(()),
                         Err(kube::Error::Api(e)) if e.code == 409 => continue,
@@ -136,7 +138,7 @@ impl Ctx {
                     }
                 }
                 Some(mut params) => {
-                    if !mutate(&mut params.spec.pvc_keys) {
+                    if !mutate(&mut params.spec) {
                         return Ok(());
                     }
                     let name = params.name_any();
@@ -201,23 +203,48 @@ pub fn node_is_ready(node: &Node) -> bool {
     ready && schedulable
 }
 
-/// Does this pod reference the PVC — directly, or via a generic ephemeral
-/// volume (derived PVC name `<pod>-<volume>`)?
-pub fn pod_references_pvc(pod: &Pod, pvc_name: &str) -> bool {
+/// Will the scheduler keep ordinary pods off this node? True when it is
+/// cordoned (`spec.unschedulable`) or carries the evacuate taint with a hard
+/// effect. This is what stands in for the attach lock under WhenClaimed: the
+/// consumer's replacement pod exists, and only the node's own state keeps it
+/// from landing back on the source mid-copy.
+pub fn node_repels_pods(node: &Node, taint_key: &str) -> bool {
+    let Some(spec) = node.spec.as_ref() else {
+        return false;
+    };
+    spec.unschedulable.unwrap_or(false)
+        || spec.taints.as_ref().is_some_and(|ts| {
+            ts.iter()
+                .any(|t| t.key == taint_key && (t.effect == "NoSchedule" || t.effect == "NoExecute"))
+        })
+}
+
+/// PVC names a pod references: plain claims, and generic ephemeral volumes
+/// under their derived name `<pod>-<volume>`.
+pub fn pod_pvc_names(pod: &Pod) -> Vec<String> {
     let pod_name = pod.name_any();
     pod.spec
         .as_ref()
         .and_then(|s| s.volumes.as_ref())
         .map(|volumes| {
-            volumes.iter().any(|v| {
-                v.persistent_volume_claim
-                    .as_ref()
-                    .map(|c| c.claim_name == pvc_name)
-                    .unwrap_or(false)
-                    || (v.ephemeral.is_some() && format!("{pod_name}-{}", v.name) == pvc_name)
-            })
+            volumes
+                .iter()
+                .filter_map(|v| {
+                    if let Some(c) = &v.persistent_volume_claim {
+                        Some(c.claim_name.clone())
+                    } else {
+                        v.ephemeral.as_ref().map(|_| format!("{pod_name}-{}", v.name))
+                    }
+                })
+                .collect()
         })
-        .unwrap_or(false)
+        .unwrap_or_default()
+}
+
+/// Does this pod reference the PVC — directly, or via a generic ephemeral
+/// volume (derived PVC name `<pod>-<volume>`)?
+pub fn pod_references_pvc(pod: &Pod, pvc_name: &str) -> bool {
+    pod_pvc_names(pod).iter().any(|n| n == pvc_name)
 }
 
 /// Pods that reference the PVC. Terminating and completed pods count: a pod
@@ -231,14 +258,23 @@ pub async fn pods_referencing_pvc(pods: &Api<Pod>, pvc_name: &str) -> Result<Vec
 }
 
 /// Has the scheduler bound this pod to a node? A never-scheduled pod holds
-/// no attachment, but it still blocks Quiescing: the strict zero-pods rule
-/// stays, this only lets the status message say which kind is in the way.
+/// no attachment. Under WhenIdle it still blocks Quiescing (strict zero-pods
+/// rule; the status message says which kind is in the way); under
+/// WhenClaimed it is the consumer waiting for the volume to arrive.
 pub fn pod_is_scheduled(pod: &Pod) -> bool {
     pod.spec
         .as_ref()
         .and_then(|s| s.node_name.as_deref())
         .map(|n| !n.is_empty())
         .unwrap_or(false)
+}
+
+/// Never-scheduled pods, name-sorted so every reconcile picks the same
+/// consumer when several exist.
+pub fn unscheduled_pods(pods: &[Pod]) -> Vec<&Pod> {
+    let mut v: Vec<&Pod> = pods.iter().filter(|p| !pod_is_scheduled(p)).collect();
+    v.sort_by_key(|p| p.name_any());
+    v
 }
 
 pub fn pod_names(pods: &[Pod]) -> Vec<String> {

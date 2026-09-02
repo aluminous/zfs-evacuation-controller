@@ -29,6 +29,7 @@ pub const PARAMS_NAME: &str = "zfs-evacuation-locks";
     shortname = "zevac",
     status = "ZFSEvacuationStatus",
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
+    printcolumn = r#"{"name":"Mode","type":"string","jsonPath":".spec.mode"}"#,
     printcolumn = r#"{"name":"Target","type":"string","jsonPath":".status.target.node"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
@@ -41,7 +42,14 @@ pub struct ZFSEvacuationSpec {
     /// NodeTaint evacuations cancel when the source node's taint is removed.
     #[serde(default)]
     pub trigger: EvacuationTrigger,
-    /// Optional explicit target node (else auto-selected).
+    /// How the consumer gets its volume back; read once, in Locking. The
+    /// NodeTaint trigger sets WhenClaimed for volumes a pod references at
+    /// trigger time and WhenIdle for the rest; Annotation sets WhenIdle.
+    #[serde(default)]
+    pub mode: EvacuationMode,
+    /// Optional explicit target node (else auto-selected). Under WhenClaimed
+    /// it also anchors the consumer's other volumes: their evacuations
+    /// follow it instead of choosing for themselves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_node: Option<String>,
     /// Optional explicit destination poolname, verbatim — may be a dataset
@@ -69,6 +77,26 @@ pub enum EvacuationTrigger {
     #[default]
     Annotation,
     NodeTaint,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema, PartialEq, Eq)]
+pub enum EvacuationMode {
+    /// The attach lock denies every pod creation referencing the PVC; the
+    /// volume moves once no pod object references it, and the workload's
+    /// replacement is created (and scheduled) only after the swap. Works
+    /// without a cordon, so it suits single-volume and emergency moves, and
+    /// places each volume on its own.
+    #[default]
+    WhenIdle,
+    /// The consumer's replacement pod is wanted: created normally, it stays
+    /// Pending because the source is cordoned, defines the group of volumes
+    /// to keep together and the placement they must satisfy, and binds the
+    /// relocated volume by itself after the swap (no delete, no recreate).
+    /// The attach lock denies only pods that bypass the cordon (spec.nodeName,
+    /// or a toleration for node.kubernetes.io/unschedulable). Quiescing
+    /// refuses to proceed with a never-scheduled consumer while the source
+    /// node is schedulable.
+    WhenClaimed,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema, PartialEq, Eq)]
@@ -146,6 +174,42 @@ pub struct TransferStatus {
     pub target_snap_delete_issued: bool,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema, PartialEq, Eq)]
+pub enum ColocationRole {
+    /// Chose the target for the whole group and reserved its capacity there.
+    #[default]
+    Leader,
+    /// Took the node a sibling already has (or is heading to).
+    Follower,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ColocationMember {
+    pub pv_name: String,
+    #[serde(default)]
+    pub capacity_bytes: u64,
+}
+
+/// WhenClaimed only: the never-scheduled consumer whose volumes are kept
+/// together, and how this evacuation's target was derived from it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ColocationStatus {
+    /// "namespace/name" of the Pending pod that defined the group.
+    pub pod: String,
+    /// The group's zfs-localpv volumes still to be moved off the source
+    /// (this one included). A Leader reserves their summed capacity on its
+    /// target until each member's own evacuation has picked a target.
+    #[serde(default)]
+    pub members: Vec<ColocationMember>,
+    #[serde(default)]
+    pub role: ColocationRole,
+    /// Follower: the sibling PV whose home decided the target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followed: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ZFSEvacuationStatus {
@@ -182,10 +246,13 @@ pub struct ZFSEvacuationStatus {
     /// RFC3339 time the PVC key was added to the VAP params (propagation grace).
     #[serde(default)]
     pub locked_at: Option<String>,
+    #[serde(default)]
+    pub colocation: Option<ColocationStatus>,
 }
 
 /// Param object for the ValidatingAdmissionPolicy. A single cluster-scoped
-/// instance named [`PARAMS_NAME`] holds every PVC currently locked.
+/// instance named [`PARAMS_NAME`] holds every PVC currently locked, in the
+/// list matching its evacuation's mode.
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
 #[kube(
     group = "zfsevac.alumino.us",
@@ -195,7 +262,40 @@ pub struct ZFSEvacuationStatus {
 )]
 #[serde(rename_all = "camelCase")]
 pub struct EvacuationParamsSpec {
-    /// "namespace/name" keys of PVCs that must not be referenced by new pods.
+    /// "namespace/name" keys of PVCs that must not be referenced by new pods
+    /// (WhenIdle).
     #[serde(default)]
     pub pvc_keys: Vec<String>,
+    /// "namespace/name" keys of PVCs that new pods may reference as long as
+    /// they go through the scheduler (WhenClaimed): pods with spec.nodeName
+    /// or a toleration for the cordon taint are denied.
+    #[serde(default)]
+    pub claimable_pvc_keys: Vec<String>,
+}
+
+impl EvacuationParamsSpec {
+    /// Put `key` in the list for `mode` and nowhere else. Returns whether
+    /// anything changed.
+    pub fn lock(&mut self, key: &str, mode: &EvacuationMode) -> bool {
+        let (into, out_of) = match mode {
+            EvacuationMode::WhenIdle => (&mut self.pvc_keys, &mut self.claimable_pvc_keys),
+            EvacuationMode::WhenClaimed => (&mut self.claimable_pvc_keys, &mut self.pvc_keys),
+        };
+        let mut changed = false;
+        if !into.iter().any(|k| k == key) {
+            into.push(key.to_string());
+            changed = true;
+        }
+        let before = out_of.len();
+        out_of.retain(|k| k != key);
+        changed || out_of.len() != before
+    }
+
+    /// Remove `key` from both lists. Returns whether anything changed.
+    pub fn unlock(&mut self, key: &str) -> bool {
+        let before = self.pvc_keys.len() + self.claimable_pvc_keys.len();
+        self.pvc_keys.retain(|k| k != key);
+        self.claimable_pvc_keys.retain(|k| k != key);
+        self.pvc_keys.len() + self.claimable_pvc_keys.len() != before
+    }
 }

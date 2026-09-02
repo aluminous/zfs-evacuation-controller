@@ -21,10 +21,20 @@ and everything referencing it — is untouched.
   CR for the new dataset; the target node agent adopts the pre-existing
   dataset and marks it Ready (the same mechanism zfs-localpv's Velero restore
   relies on).
-- **Attach lock.** A `ValidatingAdmissionPolicy` (k8s ≥ 1.30) denies creation
-  of any pod referencing a PVC under evacuation — including generic ephemeral
-  volumes and scheduler-bypassing pods. The locked-PVC set is delivered via a
-  `paramKind` object maintained by the controller (CEL cannot look up PVCs).
+- **Attach lock.** A `ValidatingAdmissionPolicy` (k8s ≥ 1.30) guards pod
+  creation against PVCs under evacuation, including generic ephemeral
+  volumes. The locked-PVC sets are delivered via a `paramKind` object
+  maintained by the controller (CEL cannot look up PVCs), one list per
+  evacuation mode: `pvcKeys` (WhenIdle) denies every referencing pod;
+  `claimablePvcKeys` (WhenClaimed) denies only pods that would bypass the
+  source node's cordon (`spec.nodeName`, or a toleration for
+  `node.kubernetes.io/unschedulable`).
+- **Co-location (WhenClaimed).** Volumes are moved with their consumer: the
+  Pending pod left behind by a drain names the group (every ZFS PVC it
+  references), the group's members pick one target under the pod's own
+  placement constraints, and the same Pending pod binds the relocated volumes
+  after the swap — kube-scheduler requeues it on the PV update, so nothing is
+  deleted or recreated.
 - **PV swap.** PV `nodeAffinity` is immutable, so the PV is deleted (its
   `pv-protection` finalizer stripped after quiescence is verified) and
   recreated with the same name and a `claimRef` carrying the PVC's UID — the
@@ -54,24 +64,41 @@ kubectl get zfsevacuations        # short name: zevac
 ```
 
 Both triggers **lock the PVC immediately** (attach lock, see above), in use
-or not, and the transfer starts once the last pod referencing it is gone.
-Nothing is evicted by the controller — drain the node yourself, or let the
-workload finish. The order matters: trigger first, evict second. With the
-lock armed before eviction, a Deployment/StatefulSet's replacement pod is
-denied at creation and the controller simply retries until the volume has
-moved, at which point the pod lands on the new node. Evicting *before* the
-lock exists lets that replacement be created as a never-scheduled pod pinned
-to the source node by PV affinity; a creation-time policy cannot touch it and
-the evacuation reports it in `status.message` — delete the pod (its
-recreation is denied) and the evacuation proceeds. Do not trigger what you
-do not intend to drain: while the lock holds, a crashed consumer cannot
-restart until the migration completes.
+or not. Nothing is evicted by the controller — drain the node yourself, or
+let the workload finish. The order matters: trigger first, evict second.
+
+An evacuation runs in one of two modes (`spec.mode`, read once when the lock
+is taken):
+
+- **WhenIdle** — the annotation trigger, and the taint trigger for volumes no
+  pod referenced at taint time. The transfer starts once the last pod
+  referencing the PVC is gone, and *no* pod may be created against it until
+  the volume has moved. A Deployment/StatefulSet replacement is denied at
+  creation and its controller retries until the swap, at which point the pod
+  lands on the new node. Volumes are placed independently — an emergency
+  mode that ignores co-location.
+- **WhenClaimed** — the taint trigger for volumes a pod referenced at taint
+  time. The intended sequence is taint, then `kubectl drain`: the evicted
+  consumer's replacement is created (the lock allows scheduler-routed pods)
+  and stays Pending, because PV affinity pins it to a cordoned node. That
+  Pending pod defines the group — all of its ZFS PVCs move to one node that
+  satisfies the pod's nodeSelector/affinity/tolerations and has room for the
+  lot (`status.colocation` records the pod, members, and which member led
+  the placement) — and once the PVs are swapped the scheduler binds the same
+  pod there. The source must stay cordoned (or tainted NoSchedule/NoExecute)
+  from drain to completion; the evacuation holds in Quiescing/Committing
+  with a `status.message` asking for the cordon otherwise. Removing the
+  taint cancels, as always.
+
+Do not trigger what you do not intend to drain: while a WhenIdle lock holds,
+a crashed consumer cannot restart until the migration completes.
 
 Cancel by removing the annotation or deleting the ZFSEvacuation — honored any
 time before the commit point (the old-PV delete); after that the machine rolls
 forward only.
 
-Optional per-evacuation tuning on the ZFSEvacuation spec: `targetNode`,
+Optional per-evacuation tuning on the ZFSEvacuation spec: `mode`,
+`targetNode` (under WhenClaimed it also anchors the pod's other volumes),
 `targetPool`, `settleSeconds`, `transferTimeoutSeconds`, `maxAttempts`,
 `headroomPercent`.
 

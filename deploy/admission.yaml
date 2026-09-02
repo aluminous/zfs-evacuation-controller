@@ -1,10 +1,19 @@
 # Attach lock: deny creation of pods that reference a PVC currently under
 # evacuation. CEL cannot look up the PVCs a pod references, so the set of
 # locked PVCs is delivered as a param object (EvacuationParams) maintained by
-# the controller. Covers plain persistentVolumeClaim volumes and generic
-# ephemeral volumes (whose PVC name is derived as <pod>-<volume>), and applies
-# at admission time — so pods that bypass the scheduler via spec.nodeName are
-# blocked too.
+# the controller, in two lists:
+#
+# - pvcKeys (WhenIdle): no pod may be created referencing the PVC. This is
+#   the whole lock — the replacement pod is denied until the volume has moved.
+# - claimablePvcKeys (WhenClaimed): pods that go through the scheduler are
+#   allowed — the consumer is meant to exist as a Pending pod and to bind the
+#   relocated volume after the swap, while the source node's cordon keeps it
+#   off the source. Denied are the pods the cordon cannot stop: spec.nodeName
+#   set at creation, or a toleration for node.kubernetes.io/unschedulable
+#   (or one that tolerates everything).
+#
+# Covers plain persistentVolumeClaim volumes and generic ephemeral volumes
+# (whose PVC name is derived as <pod>-<volume>).
 #
 # Requires Kubernetes >= 1.30 (ValidatingAdmissionPolicy GA).
 apiVersion: admissionregistration.k8s.io/v1
@@ -25,17 +34,36 @@ spec:
   variables:
     - name: lockedKeys
       expression: "params.spec.pvcKeys"
+    - name: claimableKeys
+      expression: "has(params.spec.claimablePvcKeys) ? params.spec.claimablePvcKeys : []"
+    # "namespace/pvc" for every PVC the pod references.
+    - name: referencedKeys
+      expression: >-
+        !has(object.spec.volumes) ? [] :
+        object.spec.volumes.filter(v, has(v.persistentVolumeClaim) || has(v.ephemeral)).map(v,
+          object.metadata.namespace + '/' + (has(v.persistentVolumeClaim) ?
+            v.persistentVolumeClaim.claimName : object.metadata.name + '-' + v.name))
+    # Would this pod land on a node without the scheduler's consent?
+    - name: bypassesCordon
+      expression: >-
+        (has(object.spec.nodeName) && object.spec.nodeName != '') ||
+        (has(object.spec.tolerations) && object.spec.tolerations.exists(t,
+          (!has(t.key) || t.key == '' || t.key == 'node.kubernetes.io/unschedulable') &&
+          (!has(t.effect) || t.effect == '' || t.effect == 'NoSchedule')))
   validations:
-    - expression: >-
-        !(has(object.spec.volumes) && object.spec.volumes.exists(v,
-          (has(v.persistentVolumeClaim) &&
-            (object.metadata.namespace + '/' + v.persistentVolumeClaim.claimName) in variables.lockedKeys) ||
-          (has(v.ephemeral) &&
-            (object.metadata.namespace + '/' + object.metadata.name + '-' + v.name) in variables.lockedKeys)))
+    - expression: "!variables.referencedKeys.exists(k, k in variables.lockedKeys)"
       message: >-
         pod references a PersistentVolumeClaim whose volume is being evacuated
         to another node by zfs-evacuation-controller; retry after the
         evacuation completes
+      reason: Forbidden
+    - expression: "!(variables.bypassesCordon && variables.referencedKeys.exists(k, k in variables.claimableKeys))"
+      message: >-
+        pod references a PersistentVolumeClaim whose volume is being evacuated
+        to another node by zfs-evacuation-controller, and would bypass the
+        source node's cordon (spec.nodeName, or a toleration for
+        node.kubernetes.io/unschedulable); let the scheduler place it, or
+        retry after the evacuation completes
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

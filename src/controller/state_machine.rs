@@ -6,15 +6,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context as _, Result};
+use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::{Resource, ResourceExt};
 use serde_json::json;
 
 use crate::controller::{
-    abort, node_by_id, node_ips, pods_referencing_pvc, pv_swap, secs_since, target, Ctx, Error,
-    ActiveTransfer, now_rfc3339, parse_quantity_or_bytes, DEFAULT_MAX_ATTEMPTS,
-    DEFAULT_SETTLE_SECONDS, DEFAULT_TRANSFER_TIMEOUT, LOCK_PROPAGATION_SECONDS,
+    abort, colocation, node_by_id, node_ips, pod_is_scheduled, pod_names, pods_referencing_pvc,
+    pv_swap, secs_since, target, Ctx, Error, ActiveTransfer, now_rfc3339,
+    parse_quantity_or_bytes, DEFAULT_MAX_ATTEMPTS, DEFAULT_SETTLE_SECONDS,
+    DEFAULT_TRANSFER_TIMEOUT, LOCK_PROPAGATION_SECONDS,
 };
 use crate::crd::openebs::{
     VolumeInfo, ZFSBackup, ZFSBackupSpec, ZFSRestore, ZFSRestoreSpec, ZFSSnapshot, ZFSVolume,
@@ -23,8 +25,9 @@ use crate::crd::openebs::{
     ZFS_STATUS_READY, ZFS_VOL_LABEL,
 };
 use crate::crd::zfs_evacuation::{
-    Phase, PvcRef, SourceInfo, TransferStatus, ZFSEvacuation, ZFSEvacuationStatus,
-    EVACUATE_ANNOTATION, EVACUATING_LABEL, EVACUATION_FINALIZER, GUARD_FINALIZER,
+    ColocationRole, ColocationStatus, EvacuationMode, Phase, PvcRef, SourceInfo, TransferStatus,
+    ZFSEvacuation, ZFSEvacuationStatus, EVACUATE_ANNOTATION, EVACUATING_LABEL,
+    EVACUATION_FINALIZER, GUARD_FINALIZER,
 };
 use crate::transfer::relay::Relay;
 
@@ -117,7 +120,7 @@ pub async fn fail(
     Ok(Action::await_change())
 }
 
-async fn wait(
+pub async fn wait(
     ctx: &Ctx,
     name: &str,
     st: &mut ZFSEvacuationStatus,
@@ -399,23 +402,20 @@ async fn locking(
 ) -> Result<Action> {
     let name = evac.name_any();
     let pvc_ref = st.pvc_ref.clone().ok_or_else(|| anyhow!("no pvcRef recorded"))?;
-    // Both triggers lock immediately, in-use or not. Locking before the
-    // consumer is evicted is what makes a drain safe: the workload
-    // controller's replacement pod is denied at creation instead of landing as a
-    // never-scheduled pod pinned to the source node by PV affinity — one no
-    // creation-time policy can touch, and one that holds Quiescing forever.
-    // Consequence: taint (or annotate) only what you are about to drain.
+    // Both triggers lock immediately, in-use or not. What the lock denies
+    // depends on the mode. WhenIdle: every pod creation — locking before
+    // the consumer is evicted is what makes a drain safe, since the
+    // workload controller's replacement pod is denied at creation instead of
+    // landing as a never-scheduled pod pinned to the source by PV affinity,
+    // which no creation-time policy can touch and which holds Quiescing
+    // forever. WhenClaimed: only scheduler-bypassing pods — the replacement
+    // is *meant* to exist as a Pending pod, and the cordon keeps it off the
+    // source (Quiescing checks that). Either way: taint (or annotate) only
+    // what you are about to drain.
     let key = format!("{}/{}", pvc_ref.namespace, pvc_ref.name);
-    ctx.update_params(|keys| {
-        if keys.contains(&key) {
-            false
-        } else {
-            keys.push(key.clone());
-            true
-        }
-    })
-    .await
-    .context("adding PVC to VAP params")?;
+    ctx.update_params(|params| params.lock(&key, &evac.spec.mode))
+        .await
+        .context("adding PVC to VAP params")?;
     // Human-visible marker only; the param object is the actual lock.
     ctx.pvcs(&pvc_ref.namespace)
         .patch(
@@ -444,20 +444,9 @@ async fn quiescing(
         )));
     }
     let pods = pods_referencing_pvc(&ctx.pods(&pvc_ref.namespace), &pvc_ref.name).await?;
-    if !pods.is_empty() {
+    if let Some(msg) = blocking_reason(ctx, evac, st, &pods).await? {
         st.quiesced_at = None;
-        // Strict: any pod object referencing the PVC blocks, scheduled or
-        // not. The message distinguishes them because the remedies differ —
-        // a scheduled consumer has to exit (drain it); a never-scheduled one
-        // predates the lock and only goes away by deletion.
-        return wait(
-            ctx,
-            &name,
-            st,
-            crate::controller::blocking_pods_message(&pods),
-            15,
-        )
-        .await;
+        return wait(ctx, &name, st, msg, 15).await;
     }
     let settle = evac.spec.settle_seconds.unwrap_or(DEFAULT_SETTLE_SECONDS);
     match st.quiesced_at.as_deref().and_then(secs_since) {
@@ -473,6 +462,48 @@ async fn quiescing(
     }
 }
 
+/// Is the source node keeping scheduler-routed pods away (cordon, or the
+/// evacuate taint with a hard effect)? A vanished node repels everything.
+pub async fn source_repels_pods(ctx: &Ctx, st: &ZFSEvacuationStatus) -> Result<bool> {
+    let source = st.source.as_ref().ok_or_else(|| anyhow!("no source recorded"))?;
+    Ok(match ctx.nodes().get_opt(&source.node).await? {
+        Some(node) => crate::controller::node_repels_pods(&node, &ctx.cfg.taint_key),
+        None => true,
+    })
+}
+
+/// Why the copy must not start (or, at commit, must not proceed) given the
+/// pods referencing the PVC; None when it may. WhenIdle is strict: any pod
+/// object blocks, scheduled or not — the remedies differ, so the message
+/// tells them apart. WhenClaimed lets never-scheduled pods through *if* the
+/// source node repels them; otherwise nothing would stop the scheduler from
+/// binding the consumer to the source while the copy runs.
+pub async fn blocking_reason(
+    ctx: &Ctx,
+    evac: &ZFSEvacuation,
+    st: &ZFSEvacuationStatus,
+    pods: &[Pod],
+) -> Result<Option<String>> {
+    if pods.is_empty() {
+        return Ok(None);
+    }
+    if evac.spec.mode == EvacuationMode::WhenIdle {
+        return Ok(Some(crate::controller::blocking_pods_message(pods)));
+    }
+    let scheduled: Vec<Pod> = pods.iter().filter(|p| pod_is_scheduled(p)).cloned().collect();
+    if !scheduled.is_empty() {
+        return Ok(Some(crate::controller::blocking_pods_message(&scheduled)));
+    }
+    if source_repels_pods(ctx, st).await? {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "consumer {} is waiting for this volume, but the source node is still schedulable; \
+         cordon it (kubectl cordon) so the pod cannot land there mid-copy",
+        pod_names(pods).join(", ")
+    )))
+}
+
 async fn target_selecting(
     ctx: &Ctx,
     evac: &ZFSEvacuation,
@@ -480,6 +511,7 @@ async fn target_selecting(
 ) -> Result<Action> {
     let name = evac.name_any();
     let source = st.source.clone().ok_or_else(|| anyhow!("no source recorded"))?;
+    let pvc_ref = st.pvc_ref.clone().ok_or_else(|| anyhow!("no pvcRef recorded"))?;
 
     // Serialize check-then-act across concurrent reconciles: without this,
     // two evacuations can both pass the caps/capacity checks and overcommit
@@ -503,6 +535,26 @@ async fn target_selecting(
     let Some(pv) = ctx.pvs().get_opt(&evac.spec.pv_name).await? else {
         return fail(ctx, &name, st, "PV disappeared during target selection").await;
     };
+
+    // WhenClaimed: the consumer waiting for this volume defines the group
+    // that must land together. Resolved fresh on every attempt — a sibling
+    // may have picked its target since the last one.
+    let group = if evac.spec.mode == EvacuationMode::WhenClaimed {
+        let pods = pods_referencing_pvc(&ctx.pods(&pvc_ref.namespace), &pvc_ref.name).await?;
+        colocation::resolve(ctx, &name, &pvc_ref, &source.node_id, &pods).await?
+    } else {
+        None
+    };
+    let group_extra_bytes: u128 = group
+        .as_ref()
+        .map(|g| {
+            g.members
+                .iter()
+                .filter(|m| m.pv_name != name)
+                .map(|m| m.capacity_bytes as u128)
+                .sum()
+        })
+        .unwrap_or(0);
     let input = target::SelectionInput {
         evac_name: &name,
         spec: &evac.spec,
@@ -510,6 +562,9 @@ async fn target_selecting(
         source_pool: &source.pool,
         capacity_bytes: source.capacity_bytes as u128,
         pv: &pv,
+        group_extra_bytes,
+        anchor: group.as_ref().and_then(|g| g.anchor.as_ref()).map(|a| a.node.as_str()),
+        placement: group.as_ref().map(|g| &g.placement),
     };
     match target::select_target(ctx, &input).await {
         Ok(mut t) => {
@@ -518,9 +573,33 @@ async fn target_selecting(
                 source.volume_handle,
                 rand::random::<u32>() & 0xff_ffff
             );
+            st.colocation = group.map(|g| {
+                let followed = g.anchor.filter(|_| evac.spec.target_node.is_none());
+                tracing::info!(
+                    evac = name,
+                    pod = g.pod,
+                    target = t.node,
+                    members = ?g.members.iter().map(|m| &m.pv_name).collect::<Vec<_>>(),
+                    followed = ?followed,
+                    "co-location resolved"
+                );
+                ColocationStatus {
+                    pod: g.pod,
+                    members: g.members,
+                    role: if followed.is_some() {
+                        ColocationRole::Follower
+                    } else {
+                        ColocationRole::Leader
+                    },
+                    followed: followed.map(|a| a.pv_name),
+                }
+            });
             st.target = Some(t);
             advance(ctx, &name, st, Phase::Transferring).await
         }
+        // Never split a group: a follower whose anchor cannot take it waits
+        // for the anchor to free up (busy receiving, short on space) rather
+        // than going elsewhere.
         Err(e) => wait(ctx, &name, st, format!("no target yet: {e:#}"), 60).await,
     }
 }
@@ -1118,12 +1197,7 @@ async fn cleaning_up(
     // 4. Unlock.
     if let Some(pvc_ref) = &st.pvc_ref {
         let key = format!("{}/{}", pvc_ref.namespace, pvc_ref.name);
-        ctx.update_params(|keys| {
-            let before = keys.len();
-            keys.retain(|k| k != &key);
-            keys.len() != before
-        })
-        .await?;
+        ctx.update_params(|params| params.unlock(&key)).await?;
         // PVC may legitimately be gone by now; ignore.
         let _ = ctx
             .pvcs(&pvc_ref.namespace)

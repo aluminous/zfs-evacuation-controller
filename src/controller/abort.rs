@@ -118,12 +118,7 @@ pub async fn run(
     // 5. Unlock.
     if let Some(pvc_ref) = &st.pvc_ref {
         let key = format!("{}/{}", pvc_ref.namespace, pvc_ref.name);
-        ctx.update_params(|keys| {
-            let before = keys.len();
-            keys.retain(|k| k != &key);
-            keys.len() != before
-        })
-        .await?;
+        ctx.update_params(|params| params.unlock(&key)).await?;
         let _ = ctx
             .pvcs(&pvc_ref.namespace)
             .patch(

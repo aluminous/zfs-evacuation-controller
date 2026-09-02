@@ -1,4 +1,5 @@
 use k8s_openapi::api::core::v1::PersistentVolume;
+use kube::ResourceExt;
 use serde_json::{from_value, json};
 
 use crate::controller::pv_swap::render_new_pv;
@@ -266,12 +267,12 @@ fn blocking_pods_message_separates_remedies() {
     let stranded: Pod =
         from_value(json!({"metadata": {"name": "stranded-replacement"}, "spec": {}})).unwrap();
 
-    let msg = blocking_pods_message(&[running.clone()]);
+    let msg = blocking_pods_message(std::slice::from_ref(&running));
     assert_eq!(msg, "waiting for pods to release PVC: running-consumer");
 
     // A never-scheduled pod predates the lock; the only remedy is deletion,
     // and the message must say so rather than imply it will drain away.
-    let msg = blocking_pods_message(&[stranded.clone()]);
+    let msg = blocking_pods_message(std::slice::from_ref(&stranded));
     assert!(
         msg.starts_with("never-scheduled pods predate the lock"),
         "{msg}"
@@ -317,4 +318,166 @@ async fn relay_buffers_source_until_target_connects() {
     dst.read_to_end(&mut got).await.unwrap();
     assert_eq!(got, payload);
     assert_eq!(relay.task.await.unwrap().unwrap(), payload.len() as u64);
+}
+
+#[test]
+fn params_lock_lists_follow_mode() {
+    use crate::crd::zfs_evacuation::{EvacuationMode, EvacuationParamsSpec};
+
+    let mut p = EvacuationParamsSpec::default();
+    assert!(p.lock("ns/a", &EvacuationMode::WhenIdle));
+    assert!(!p.lock("ns/a", &EvacuationMode::WhenIdle), "idempotent");
+    assert_eq!(p.pvc_keys, vec!["ns/a"]);
+    assert!(p.claimable_pvc_keys.is_empty());
+
+    // Re-locking under the other mode moves the key, never duplicates it.
+    assert!(p.lock("ns/a", &EvacuationMode::WhenClaimed));
+    assert!(p.pvc_keys.is_empty());
+    assert_eq!(p.claimable_pvc_keys, vec!["ns/a"]);
+
+    assert!(p.lock("ns/b", &EvacuationMode::WhenIdle));
+    assert!(p.unlock("ns/a"));
+    assert!(!p.unlock("ns/a"));
+    assert_eq!(p.pvc_keys, vec!["ns/b"]);
+    assert!(p.claimable_pvc_keys.is_empty());
+}
+
+#[test]
+fn node_repels_pods_cases() {
+    use crate::controller::node_repels_pods;
+    use k8s_openapi::api::core::v1::Node;
+    let key = "zfsevac.alumino.us/evacuate";
+
+    let node = |spec: serde_json::Value| -> Node {
+        from_value(json!({"metadata": {"name": "n"}, "spec": spec})).unwrap()
+    };
+    assert!(!node_repels_pods(&node(json!({})), key));
+    assert!(node_repels_pods(&node(json!({"unschedulable": true})), key));
+    // The soft effect the trigger uses contributes nothing; the cordon does.
+    assert!(!node_repels_pods(
+        &node(json!({"taints": [{"key": key, "effect": "PreferNoSchedule"}]})),
+        key
+    ));
+    assert!(node_repels_pods(
+        &node(json!({"taints": [{"key": key, "effect": "NoSchedule"}]})),
+        key
+    ));
+    // Someone else's hard taint may be tolerated by the consumer; not ours to judge.
+    assert!(!node_repels_pods(
+        &node(json!({"taints": [{"key": "other", "effect": "NoSchedule"}]})),
+        key
+    ));
+}
+
+#[test]
+fn placement_honours_pod_constraints() {
+    use crate::controller::placement::Placement;
+    use k8s_openapi::api::core::v1::{Node, Pod};
+
+    let node = |name: &str, labels: serde_json::Value, taints: serde_json::Value| -> Node {
+        from_value(json!({
+            "metadata": {"name": name, "labels": labels},
+            "spec": {"taints": taints}
+        }))
+        .unwrap()
+    };
+    let gpu = node("gpu-1", json!({"tier": "gpu", "zone": "a", "cores": "32"}), json!([]));
+    let plain = node("plain-1", json!({"tier": "plain", "zone": "b", "cores": "8"}), json!([]));
+    let tainted = node(
+        "dedicated-1",
+        json!({"tier": "gpu"}),
+        json!([{"key": "dedicated", "value": "ml", "effect": "NoSchedule"}]),
+    );
+    let soft = node(
+        "soft-1",
+        json!({"tier": "gpu"}),
+        json!([{"key": "dedicated", "effect": "PreferNoSchedule"}]),
+    );
+
+    let pod = |spec: serde_json::Value| -> Pod {
+        from_value(json!({"metadata": {"name": "p"}, "spec": spec})).unwrap()
+    };
+
+    // No constraints: everything without a hard taint is fine.
+    let any = Placement::from_pod(&pod(json!({})));
+    assert!(any.admits(&gpu) && any.admits(&plain) && any.admits(&soft));
+    assert!(!any.admits(&tainted));
+
+    let sel = Placement::from_pod(&pod(json!({"nodeSelector": {"tier": "gpu"}})));
+    assert!(sel.admits(&gpu) && !sel.admits(&plain));
+
+    let affinity = Placement::from_pod(&pod(json!({"affinity": {"nodeAffinity": {
+        "requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [
+            {"matchExpressions": [
+                {"key": "zone", "operator": "NotIn", "values": ["b"]},
+                {"key": "cores", "operator": "Gt", "values": ["16"]}
+            ]},
+            {"matchFields": [{"key": "metadata.name", "operator": "In", "values": ["plain-1"]}]}
+        ]}}}})));
+    assert!(affinity.admits(&gpu), "first term");
+    assert!(affinity.admits(&plain), "second term (by name)");
+    assert!(!affinity.admits(&soft), "neither term: no zone/cores labels, wrong name");
+
+    // Preferred affinity is not a constraint.
+    let preferred = Placement::from_pod(&pod(json!({"affinity": {"nodeAffinity": {
+        "preferredDuringSchedulingIgnoredDuringExecution": [{"weight": 1, "preference": {
+            "matchExpressions": [{"key": "zone", "operator": "In", "values": ["z"]}]}}]}}})));
+    assert!(preferred.admits(&plain));
+
+    let tolerant = Placement::from_pod(&pod(json!({"tolerations": [
+        {"key": "dedicated", "operator": "Equal", "value": "ml", "effect": "NoSchedule"}
+    ]})));
+    assert!(tolerant.admits(&tainted));
+    let wrong_value = Placement::from_pod(&pod(json!({"tolerations": [
+        {"key": "dedicated", "operator": "Equal", "value": "batch", "effect": "NoSchedule"}
+    ]})));
+    assert!(!wrong_value.admits(&tainted));
+    let exists_all = Placement::from_pod(&pod(json!({"tolerations": [{"operator": "Exists"}]})));
+    assert!(exists_all.admits(&tainted));
+    let no_execute_only = Placement::from_pod(&pod(json!({"tolerations": [
+        {"operator": "Exists", "effect": "NoExecute"}
+    ]})));
+    assert!(!no_execute_only.admits(&tainted));
+}
+
+#[test]
+fn anchor_majority_then_name() {
+    use crate::controller::colocation::{pick_anchor, Anchor};
+    let a = |node: &str, pv: &str| Anchor { node: node.into(), pv_name: pv.into(), how: "test" };
+
+    assert_eq!(pick_anchor(vec![]), None);
+    assert_eq!(pick_anchor(vec![a("n2", "pv-1")]).unwrap().node, "n2");
+    // Majority wins: fewest volumes have to move again.
+    let split = pick_anchor(vec![a("n2", "pv-1"), a("n3", "pv-2"), a("n2", "pv-3")]).unwrap();
+    assert_eq!((split.node.as_str(), split.pv_name.as_str()), ("n2", "pv-1"));
+    // Ties are broken by node string so every reconcile agrees.
+    assert_eq!(pick_anchor(vec![a("n3", "x"), a("n2", "y")]).unwrap().node, "n2");
+}
+
+#[test]
+fn pod_pvc_names_and_consumer_order() {
+    use crate::controller::{pod_pvc_names, unscheduled_pods};
+    use k8s_openapi::api::core::v1::Pod;
+
+    let pod: Pod = from_value(json!({
+        "metadata": {"name": "worker"},
+        "spec": {"volumes": [
+            {"name": "data", "persistentVolumeClaim": {"claimName": "data-0"}},
+            {"name": "scratch", "ephemeral": {"volumeClaimTemplate": {"spec": {}}}},
+            {"name": "cfg", "configMap": {"name": "cfg"}}
+        ]}
+    }))
+    .unwrap();
+    assert_eq!(pod_pvc_names(&pod), vec!["data-0", "worker-scratch"]);
+
+    let mk = |name: &str, node: Option<&str>| -> Pod {
+        let mut spec = json!({});
+        if let Some(n) = node {
+            spec["nodeName"] = json!(n);
+        }
+        from_value(json!({"metadata": {"name": name}, "spec": spec})).unwrap()
+    };
+    let pods = vec![mk("z-pending", None), mk("a-running", Some("n1")), mk("b-pending", None)];
+    let names: Vec<String> = unscheduled_pods(&pods).iter().map(|p| p.name_any()).collect();
+    assert_eq!(names, vec!["b-pending", "z-pending"]);
 }

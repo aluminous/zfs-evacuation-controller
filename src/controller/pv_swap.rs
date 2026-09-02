@@ -12,10 +12,10 @@ use kube::runtime::controller::Action;
 use kube::{Resource, ResourceExt};
 use serde_json::json;
 
-use crate::controller::state_machine::{advance, fail, set_finalizers};
-use crate::controller::{pods_referencing_pvc, Ctx};
+use crate::controller::state_machine::{advance, blocking_reason, fail, set_finalizers, wait};
+use crate::controller::{pod_is_scheduled, pods_referencing_pvc, Ctx};
 use crate::crd::openebs::{NODE_ID_TOPOLOGY_KEY, POOLNAME_ATTRIBUTE};
-use crate::crd::zfs_evacuation::{Phase, ZFSEvacuation, ZFSEvacuationStatus};
+use crate::crd::zfs_evacuation::{EvacuationMode, Phase, ZFSEvacuation, ZFSEvacuationStatus};
 
 const PV_PROTECTION: &str = "kubernetes.io/pv-protection";
 const PROVISIONER_FINALIZER: &str = "external-provisioner.volume.kubernetes.io/finalizer";
@@ -43,16 +43,29 @@ pub async fn committing(
         return Ok(Action::requeue(Duration::from_secs(1)));
     }
     let pods = pods_referencing_pvc(&ctx.pods(&pvc_ref.namespace), &pvc_ref.name).await?;
-    if !pods.is_empty() {
-        // Should be impossible with the VAP lock; abort loudly rather than
-        // swap under a live consumer.
+    let scheduled: Vec<_> = pods.iter().filter(|p| pod_is_scheduled(p)).cloned().collect();
+    let unexpected = match evac.spec.mode {
+        // Should be impossible with the VAP lock.
+        EvacuationMode::WhenIdle => pods.clone(),
+        // The Pending consumer is expected; a *scheduled* one means the
+        // source stopped repelling pods mid-copy and the consumer landed.
+        EvacuationMode::WhenClaimed => scheduled,
+    };
+    if !unexpected.is_empty() {
+        // Abort loudly rather than swap under a live consumer.
         st.phase = Phase::Aborting;
         st.message = Some(format!(
             "pods appeared at commit despite lock: {}",
-            crate::controller::pod_names(&pods).join(", ")
+            crate::controller::pod_names(&unexpected).join(", ")
         ));
         ctx.write_status(&name, st).await?;
         return Ok(Action::requeue(Duration::from_secs(1)));
+    }
+    // WhenClaimed with the source uncordoned: nothing is wrong yet, but the
+    // swap window is exactly when the scheduler would bind the consumer to
+    // the source. Hold here until the node repels pods again.
+    if let Some(msg) = blocking_reason(ctx, evac, st, &pods).await? {
+        return wait(ctx, &name, st, msg, 15).await;
     }
 
     let old_pv = ctx
