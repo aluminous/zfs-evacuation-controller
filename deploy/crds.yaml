@@ -57,7 +57,10 @@ spec:
                 nullable: true
                 type: string
               targetPool:
-                description: Optional explicit target pool (else same pool name as source).
+                description: |-
+                  Optional explicit destination poolname, verbatim — may be a dataset
+                  path ("zroot/csi"). Default: the PV's StorageClass `poolname`
+                  parameter, else the source volume's poolName carried over.
                 nullable: true
                 type: string
               transferTimeoutSeconds:
@@ -214,6 +217,9 @@ spec:
                   nodeId:
                     type: string
                   pool:
+                    description: |-
+                      Full destination poolname (may be a dataset path): becomes the new
+                      ZFSVolume's poolName. Capacity accounting uses its zpool component.
                     type: string
                 required:
                 - newVolumeHandle
@@ -233,6 +239,13 @@ spec:
                     minimum: 0.0
                     nullable: true
                     type: integer
+                  failureReason:
+                    description: |-
+                      Set the moment an attempt is judged failed; the attempt's CRs are
+                      then torn down across several reconciles and this keeps the verdict
+                      from being re-derived (wrongly) from the torn-down state.
+                    nullable: true
+                    type: string
                   ports:
                     description: '[backup_port, restore_port] the relay listens on.'
                     items:

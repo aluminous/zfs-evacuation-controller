@@ -134,6 +134,11 @@ pub struct TransferStatus {
     pub bytes_relayed: Option<u64>,
     #[serde(default)]
     pub started_at: Option<String>,
+    /// Set the moment an attempt is judged failed; the attempt's CRs are
+    /// then torn down across several reconciles and this keeps the verdict
+    /// from being re-derived (wrongly) from the torn-down state.
+    #[serde(default)]
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema)]

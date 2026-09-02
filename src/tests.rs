@@ -248,3 +248,34 @@ fn blocking_pods_message_separates_remedies() {
         "{msg}"
     );
 }
+
+/// The relay must take the source's bytes before the target exists (the
+/// agents' `nc -w 3` dies on a 3 s idle socket) and hand them over intact
+/// once it does.
+#[tokio::test]
+async fn relay_buffers_source_until_target_connects() {
+    use crate::transfer::relay::{IpNet, Relay};
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let lo = vec![IpNet::host("127.0.0.1".parse().unwrap())];
+    let relay = Relay::spawn(lo.clone(), lo).await.unwrap();
+    assert!(!relay.source_connected.load(Ordering::Acquire));
+
+    let payload: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+    let mut src = TcpStream::connect(("127.0.0.1", relay.backup_port)).await.unwrap();
+    src.write_all(&payload).await.unwrap();
+    src.shutdown().await.unwrap();
+    // Everything was accepted with no target in sight: the source is done.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(relay.source_connected.load(Ordering::Acquire));
+    assert_eq!(relay.bytes.load(Ordering::Relaxed), 0, "nothing delivered yet");
+    assert!(!relay.task.is_finished());
+
+    let mut dst = TcpStream::connect(("127.0.0.1", relay.restore_port)).await.unwrap();
+    let mut got = Vec::new();
+    dst.read_to_end(&mut got).await.unwrap();
+    assert_eq!(got, payload);
+    assert_eq!(relay.task.await.unwrap().unwrap(), payload.len() as u64);
+}

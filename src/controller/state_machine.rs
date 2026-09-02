@@ -548,6 +548,13 @@ async fn transferring(
         return start_attempt(ctx, evac, st, 1).await;
     };
 
+    // An attempt already judged failed is only ever torn down; re-deriving a
+    // verdict from its half-deleted CRs and dropped relay would replace the
+    // real reason with a bogus one ("controller restarted").
+    if let Some(reason) = t.failure_reason.clone() {
+        return retry_or_fail(ctx, evac, st, &t, max_attempts, &reason).await;
+    }
+
     // CR statuses come FIRST: a transfer that completed while we weren't
     // looking (e.g. across a controller restart) must advance, not be torn
     // down and re-copied.
@@ -569,13 +576,16 @@ async fn transferring(
                     .last_activity
                     .load(std::sync::atomic::Ordering::Relaxed),
                 t.relay.task.is_finished(),
+                t.relay
+                    .source_connected
+                    .load(std::sync::atomic::Ordering::Acquire),
             )
         })
     };
 
     if bkp_status == BKP_STATUS_DONE && rst_status == BKP_STATUS_DONE {
         drop_relay(ctx, &name);
-        if let Some((_, bytes, _, _)) = mem {
+        if let Some((_, bytes, _, _, _)) = mem {
             st.transfer.as_mut().unwrap().bytes_relayed = Some(bytes);
         }
         tracing::info!(evac = name, bytes = ?st.transfer.as_ref().and_then(|x| x.bytes_relayed), "transfer complete");
@@ -594,12 +604,7 @@ async fn transferring(
             .await;
         }
     }
-    let elapsed = t.started_at.as_deref().and_then(secs_since).unwrap_or(0);
-    if elapsed > timeout {
-        return retry_or_fail(ctx, evac, st, &t, max_attempts, "transfer timed out").await;
-    }
-
-    let Some((mem_attempt, bytes, last_activity, task_finished)) = mem else {
+    let Some((mem_attempt, bytes, last_activity, task_finished, source_connected)) = mem else {
         // A recorded, non-terminal attempt with no live relay: the controller
         // restarted mid-transfer. Invalidate the attempt.
         return retry_or_fail(ctx, evac, st, &t, max_attempts, "controller restarted mid-transfer")
@@ -617,6 +622,19 @@ async fn transferring(
         return Ok(Action::requeue(Duration::from_secs(1)));
     }
 
+    // The target is dialed only once the source is connected and flowing:
+    // the agents' `nc -w 3` closes any connection idle for 3 s, so a target
+    // that connects before the source has bytes dies before the stream
+    // starts (and burns an attempt in exactly 3 s).
+    if rst.is_none() {
+        if !source_connected {
+            return wait(ctx, &name, st, format!("transfer attempt {} waiting for source", t.attempt), 2)
+                .await;
+        }
+        create_restore(ctx, st, &name, t.attempt, t.ports.get(1).copied().unwrap_or(0)).await?;
+        return Ok(Action::requeue(Duration::from_secs(2)));
+    }
+
     // Stall detection only applies while the stream is live: once the relay
     // task has finished, all bytes are delivered and we're waiting on the
     // agents' status flips (recv finalization can legitimately take a while;
@@ -628,6 +646,17 @@ async fn transferring(
     if !task_finished && now.saturating_sub(last_activity) > ctx.cfg.stall_seconds {
         return retry_or_fail(ctx, evac, st, &t, max_attempts, "transfer stalled (no bytes)")
             .await;
+    }
+
+    // The attempt timeout bounds everything EXCEPT a flowing stream: time to
+    // the first byte and the agents' post-stream finalization. A slow link
+    // is not a failure — tearing down a progressing transfer only to restart
+    // it from zero can never finish — and the stall detector above already
+    // guards a stream that stops moving.
+    let elapsed = t.started_at.as_deref().and_then(secs_since).unwrap_or(0);
+    let flowing = !task_finished && bytes > 0;
+    if !flowing && elapsed > timeout {
+        return retry_or_fail(ctx, evac, st, &t, max_attempts, "transfer timed out").await;
     }
 
     // Progress heartbeat.
@@ -656,6 +685,9 @@ async fn retry_or_fail(
 ) -> Result<Action> {
     let name = evac.name_any();
     drop_relay(ctx, &name);
+    if let Some(x) = st.transfer.as_mut() {
+        x.failure_reason = Some(reason.to_string());
+    }
     let gone = cleanup_transfer_crs(ctx, &name, t.attempt, st).await?;
     if !gone {
         return wait(ctx, &name, st, format!("attempt {} failed ({reason}); cleaning up", t.attempt), 10)
@@ -788,36 +820,13 @@ async fn start_attempt(
         ports: vec![backup_port, restore_port],
         bytes_relayed: None,
         started_at: Some(now_rfc3339()),
+        failure_reason: None,
     });
     st.message = Some(format!("transfer attempt {attempt} starting"));
     ctx.write_status(&name, st).await?;
 
-    // Adapted volSpec for the receive side.
-    let zv_api: Api<ZFSVolume> = ctx.openebs();
-    let zv = zv_api
-        .get_opt(&source.volume_handle)
-        .await?
-        .ok_or_else(|| anyhow!("source ZFSVolume disappeared"))?;
-    let mut vol_spec: VolumeInfo = zv.spec.0.clone();
-    vol_spec.owner_node_id = target.node_id.clone();
-    vol_spec.pool_name = target.pool.clone();
-    vol_spec.snapname = None;
-
-    // Restore first (its listener side has no ordering requirement, but both
-    // must find the relay listening — which it already is).
-    let rst_api: Api<ZFSRestore> = ctx.openebs();
-    let mut rst = ZFSRestore::new(
-        &rst_name(&name, attempt),
-        ZFSRestoreSpec {
-            volume_name: target.new_volume_handle.clone(),
-            owner_node_id: target.node_id.clone(),
-            restore_src: format!("{}:{}", ctx.cfg.pod_ip, restore_port),
-        },
-        vol_spec,
-    );
-    rst.status = Some(BKP_STATUS_INIT.to_string());
-    create_if_absent(&rst_api, &rst).await?;
-
+    // Source only. The ZFSRestore follows from `transferring` once the
+    // source has connected to the relay (see there for why).
     let bkp_api: Api<ZFSBackup> = ctx.openebs();
     let mut bkp = ZFSBackup::new(
         &bkp_name(&name, attempt),
@@ -831,7 +840,43 @@ async fn start_attempt(
     );
     bkp.status = Some(BKP_STATUS_INIT.to_string());
     create_if_absent(&bkp_api, &bkp).await?;
-    Ok(Action::requeue(Duration::from_secs(5)))
+    Ok(Action::requeue(Duration::from_secs(2)))
+}
+
+/// Create the receive side of an attempt, pointed at the relay's restore
+/// port, with the source's volSpec adapted to the target node/pool.
+async fn create_restore(
+    ctx: &Ctx,
+    st: &ZFSEvacuationStatus,
+    name: &str,
+    attempt: u32,
+    restore_port: u16,
+) -> Result<()> {
+    let source = st.source.clone().ok_or_else(|| anyhow!("no source recorded"))?;
+    let target = st.target.clone().ok_or_else(|| anyhow!("no target recorded"))?;
+    let zv_api: Api<ZFSVolume> = ctx.openebs();
+    let zv = zv_api
+        .get_opt(&source.volume_handle)
+        .await?
+        .ok_or_else(|| anyhow!("source ZFSVolume disappeared"))?;
+    let mut vol_spec: VolumeInfo = zv.spec.0.clone();
+    vol_spec.owner_node_id = target.node_id.clone();
+    vol_spec.pool_name = target.pool.clone();
+    vol_spec.snapname = None;
+
+    let rst_api: Api<ZFSRestore> = ctx.openebs();
+    let mut rst = ZFSRestore::new(
+        &rst_name(name, attempt),
+        ZFSRestoreSpec {
+            volume_name: target.new_volume_handle.clone(),
+            owner_node_id: target.node_id.clone(),
+            restore_src: format!("{}:{}", ctx.cfg.pod_ip, restore_port),
+        },
+        vol_spec,
+    );
+    rst.status = Some(BKP_STATUS_INIT.to_string());
+    tracing::info!(evac = name, attempt, "source connected; creating restore");
+    create_if_absent(&rst_api, &rst).await
 }
 
 /// Addresses the relay should accept from for a given node: the node's own

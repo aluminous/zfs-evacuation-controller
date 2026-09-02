@@ -5,9 +5,17 @@
 //! `restoreSrc` and reads it. We listen on two ports (one per role — a single
 //! port could not tell sender from receiver apart), pin each to the expected
 //! node's IPs, accept exactly one matching connection each, and copy bytes.
+//!
+//! Both agents run `nc -w 3`, and OpenBSD netcat's `-w` is an *idle* timeout:
+//! any 3 s window with no traffic on a connection closes it, on either side.
+//! So the target must not be connected before the source has bytes to give
+//! it (the state machine creates the ZFSRestore only after
+//! `source_connected`), and the source must never be left unread while the
+//! target is still on its way: the source is pumped into a bounded buffer as
+//! soon as it connects, and the buffer drains into the target once it arrives.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -60,8 +68,20 @@ pub struct Relay {
     pub bytes: Arc<AtomicU64>,
     /// Unix seconds of last observed progress (accept or data), for stall detection.
     pub last_activity: Arc<AtomicU64>,
+    /// Set once the source agent's connection has been accepted — the cue
+    /// to create the ZFSRestore so the target connects to a stream that is
+    /// already flowing.
+    pub source_connected: Arc<AtomicBool>,
     pub task: JoinHandle<Result<u64>>,
 }
+
+/// Chunk size read from the source per syscall.
+const CHUNK: usize = 256 * 1024;
+/// How much of the send stream may be held in memory while the target has
+/// not connected yet (chunks × CHUNK). Sized against the pod's memory limit;
+/// at direct-path speeds this covers several seconds of source flow, which
+/// is far longer than a ZFSRestore takes to turn into a connection.
+const BUFFER_CHUNKS: usize = 256;
 
 impl Relay {
     /// Bind both listeners (ephemeral ports) and start the splice task.
@@ -79,17 +99,55 @@ impl Relay {
 
         let bytes = Arc::new(AtomicU64::new(0));
         let last_activity = Arc::new(AtomicU64::new(now_secs()));
+        let source_connected = Arc::new(AtomicBool::new(false));
 
         let b = bytes.clone();
         let la = last_activity.clone();
+        let sc = source_connected.clone();
         let task = tokio::spawn(async move {
-            // Accept concurrently: CR creation order doesn't guarantee which
-            // agent dials first.
-            let (src, dst) = tokio::try_join!(
-                accept_from(backup_listener, &backup_peers, "backup/source", &la),
-                accept_from(restore_listener, &restore_peers, "restore/target", &la),
-            )?;
-            splice(src, dst, &b, &la).await
+            let mut src =
+                accept_from(backup_listener, &backup_peers, "backup/source", &la).await?;
+            sc.store(true, Ordering::Release);
+            // Pump the source into a bounded queue right away so its `nc`
+            // never sees an idle socket; the target side drains the queue
+            // once it connects. Backpressure past BUFFER_CHUNKS stalls the
+            // reader, and the source's own idle timeout then bounds how long
+            // a target can take to appear.
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(BUFFER_CHUNKS);
+            let la_r = la.clone();
+            // Aborting the relay task (drop_relay) must take the reader
+            // with it, or it would keep the source socket open until the
+            // next read returned.
+            let mut reader = AbortOnDrop(tokio::spawn(async move {
+                let mut buf = vec![0u8; CHUNK];
+                loop {
+                    let n = src.read(&mut buf).await.context("relay read")?;
+                    if n == 0 {
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    la_r.store(now_secs(), Ordering::Relaxed);
+                    if tx.send(buf[..n].to_vec()).await.is_err() {
+                        bail!("relay writer gone");
+                    }
+                }
+            }));
+            let mut dst =
+                accept_from(restore_listener, &restore_peers, "restore/target", &la).await?;
+            let mut total: u64 = 0;
+            while let Some(chunk) = rx.recv().await {
+                dst.write_all(&chunk).await.context("relay write")?;
+                total += chunk.len() as u64;
+                b.store(total, Ordering::Relaxed);
+                la.store(now_secs(), Ordering::Relaxed);
+            }
+            // The queue closed: the reader finished (EOF) or failed.
+            (&mut reader.0).await.context("relay reader task")??;
+            dst.shutdown().await.ok();
+            if total == 0 {
+                bail!("relay stream closed with zero bytes transferred");
+            }
+            tracing::info!(total, "relay stream complete");
+            Ok(total)
         });
 
         Ok(Relay {
@@ -97,8 +155,17 @@ impl Relay {
             restore_port,
             bytes,
             last_activity,
+            source_connected,
             task,
         })
+    }
+}
+
+struct AbortOnDrop<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -133,28 +200,3 @@ async fn accept_from(
     }
 }
 
-async fn splice(
-    mut src: TcpStream,
-    mut dst: TcpStream,
-    bytes: &AtomicU64,
-    last_activity: &AtomicU64,
-) -> Result<u64> {
-    let mut buf = vec![0u8; 256 * 1024];
-    let mut total: u64 = 0;
-    loop {
-        let n = src.read(&mut buf).await.context("relay read")?;
-        if n == 0 {
-            break;
-        }
-        dst.write_all(&buf[..n]).await.context("relay write")?;
-        total += n as u64;
-        bytes.store(total, Ordering::Relaxed);
-        last_activity.store(now_secs(), Ordering::Relaxed);
-    }
-    dst.shutdown().await.ok();
-    if total == 0 {
-        bail!("relay stream closed with zero bytes transferred");
-    }
-    tracing::info!(total, "relay stream complete");
-    Ok(total)
-}

@@ -114,6 +114,19 @@ is removed (a *deleted* node is not a cancel). The taint key defaults to
 - Quiescence is "no pod objects + settle period" (default 90 s): the guarantee
   is crash-consistency in the worst case; the VAP lock prevents any writer
   from re-attaching mid-copy.
+- Transfer sequencing: each attempt creates the ZFSBackup first and the
+  ZFSRestore only once the source has connected to the relay, which buffers
+  the send stream (up to 64 MiB) until the target arrives. This matters
+  because the zfs-localpv agents run `nc -w 3`, where `-w` is an *idle*
+  timeout: a restore that connects before the source has produced bytes dies
+  after exactly 3 s, and so does either side of a stream that stalls for 3 s
+  mid-flight (relayed/DERP paths between nodes do this routinely — give nodes
+  a direct path). `transferTimeoutSeconds` (default 3600) bounds the wait for
+  the source, the wait for the target and a stalled stream, but never kills a
+  stream that is still moving bytes; a stall longer than
+  `TRANSFER_STALL_SECONDS` (default 120) fails the attempt. Up to
+  `maxAttempts` (default 3) per evacuation; the reason each attempt failed is
+  recorded in `status.transfer.failureReason` and in the events.
 - The relay is cleartext TCP; its access control is the runtime peer
   allowlist, derived live from the Node objects (node addresses + pod CIDRs),
   scoped per attempt to the two expected nodes, single-accept, on random
