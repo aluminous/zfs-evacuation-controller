@@ -139,6 +139,11 @@ pub struct TransferStatus {
     /// from being re-derived (wrongly) from the torn-down state.
     #[serde(default)]
     pub failure_reason: Option<String>,
+    /// CleaningUp has issued the delete of the ZFSSnapshot CR that stands in
+    /// for the received copy of the transfer snapshot on the target; a later
+    /// reconcile that finds no CR must not register it again.
+    #[serde(default)]
+    pub target_snap_delete_issued: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema)]

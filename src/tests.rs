@@ -185,6 +185,43 @@ fn destination_poolname_resolution() {
 }
 
 #[test]
+fn target_snapshot_cr_addresses_received_snapshot() {
+    use crate::controller::state_machine::target_snapshot_cr;
+    use crate::crd::openebs::{VolumeInfo, ZFS_VOL_LABEL};
+    use kube::ResourceExt;
+    // The agent on the target builds `<poolName>/<ZFS_VOL_LABEL>@<name>` and
+    // only acts on CRs whose ownerNodeID is its own — every one of those
+    // must point at the received dataset, not the source.
+    let target = TargetInfo {
+        node: "node2".into(),
+        node_id: "node2-id".into(),
+        pool: "zroot/csi".into(),
+        new_volume_handle: "pvc-1-abcdef0".into(),
+    };
+    let src_info: VolumeInfo = from_value(json!({
+        "ownerNodeID": "node1-id",
+        "poolName": "zroot",
+        "capacity": "10737418240",
+        "volumeType": "DATASET",
+        "fsType": "zfs",
+        "snapname": "clone-origin",
+        "recordsize": "128k"
+    }))
+    .unwrap();
+    let snap = target_snapshot_cr(&target, "zevac-a1-beef", src_info);
+    assert_eq!(snap.name_any(), "zevac-a1-beef");
+    assert_eq!(snap.labels()[ZFS_VOL_LABEL], "pvc-1-abcdef0");
+    assert_eq!(snap.labels()["kubernetes.io/nodename"], "node2-id");
+    assert_eq!(snap.spec.0.owner_node_id, "node2-id");
+    assert_eq!(snap.spec.0.pool_name, "zroot/csi");
+    assert_eq!(snap.spec.0.snapname, None);
+    // CRD-required fields and unmodeled properties ride along.
+    assert_eq!(snap.spec.0.capacity.as_deref(), Some("10737418240"));
+    assert_eq!(snap.spec.0.volume_type.as_deref(), Some("DATASET"));
+    assert_eq!(snap.spec.0.extra["recordsize"], "128k");
+}
+
+#[test]
 fn crd_generation_is_valid() {
     use kube::CustomResourceExt;
     let crd = crate::crd::zfs_evacuation::ZFSEvacuation::crd();

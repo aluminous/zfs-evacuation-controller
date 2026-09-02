@@ -259,6 +259,13 @@ spec:
                   startedAt:
                     nullable: true
                     type: string
+                  targetSnapDeleteIssued:
+                    default: false
+                    description: |-
+                      CleaningUp has issued the delete of the ZFSSnapshot CR that stands in
+                      for the received copy of the transfer snapshot on the target; a later
+                      reconcile that finds no CR must not register it again.
+                    type: boolean
                 required:
                 - attempt
                 - ports

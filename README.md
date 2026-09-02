@@ -136,6 +136,16 @@ is removed (a *deleted* node is not a cancel). The taint key defaults to
   loudly on corruption.
 - If a node is deleted while CRs still reference it, the controller strips
   the stuck `zfs.openebs.io/finalizer` itself — the disk left with the node.
+- The transfer snapshot exists twice: `zfs send` needs one on the source
+  (`@zevac-a<attempt>-<hex>`, made by the ZFSBackup and destroyed by its
+  finalizer), and the received stream recreates it on the target, where
+  nothing in zfs-localpv knows about it. CleaningUp destroys the target copy
+  through the target's node agent — it registers a ZFSSnapshot CR for it
+  (the agent's create is a no-op on an existing snapshot) and deletes the CR
+  so the agent's finalizer runs `zfs destroy`. This runs before the source
+  dataset is destroyed, so a target agent that never answers leaves both
+  copies intact rather than a snapshot that silently pins every block the
+  volume later overwrites.
 
 ## Development
 

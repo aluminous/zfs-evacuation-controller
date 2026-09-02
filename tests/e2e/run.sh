@@ -86,6 +86,8 @@ log "assert source dataset destroyed, target dataset present, collision untouche
 $NODE1_SSH sudo zfs list "tank/$OLD_HANDLE" >/dev/null 2>&1 && fail "source dataset still exists"
 $NODE2_SSH sudo zfs list "tank/$NEW_HANDLE" >/dev/null 2>&1 || fail "target dataset missing"
 $NODE2_SSH sudo zfs list "tank/${OLD_HANDLE}-collision" >/dev/null 2>&1 || fail "colliding dataset was destroyed"
+[ -z "$($NODE2_SSH sudo zfs list -H -t snapshot -o name "tank/$NEW_HANDLE" 2>/dev/null)" ] || fail "transfer snapshot leaked on target"
+[ -z "$(kubectl get zfssnapshots -n openebs -l openebs.io/persistent-volume="$NEW_HANDLE" -o name)" ] || fail "cleanup ZFSSnapshot CR left behind"
 
 log "verify data via a reader pod on the new node"
 kubectl apply -n "$NS" -f - <<EOF

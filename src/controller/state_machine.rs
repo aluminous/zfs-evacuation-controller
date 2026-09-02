@@ -764,6 +764,107 @@ where
     .await
 }
 
+/// The ZFSSnapshot CR that stands in for the target-side copy of the transfer
+/// snapshot: the agent on the target node names the dataset from the
+/// `ZFS_VOL_LABEL` label, the pool from the spec, and only acts on CRs whose
+/// `ownerNodeID` is its own.
+pub fn target_snapshot_cr(
+    target: &crate::crd::zfs_evacuation::TargetInfo,
+    snap_name: &str,
+    mut info: VolumeInfo,
+) -> ZFSSnapshot {
+    info.owner_node_id = target.node_id.clone();
+    info.pool_name = target.pool.clone();
+    info.snapname = None;
+    let mut snap = ZFSSnapshot::new(snap_name, crate::crd::openebs::ZFSSnapshotSpec(info));
+    let labels = snap.meta_mut().labels.get_or_insert_with(Default::default);
+    labels.insert("kubernetes.io/nodename".into(), target.node_id.clone());
+    labels.insert(ZFS_VOL_LABEL.into(), target.new_volume_handle.clone());
+    snap
+}
+
+/// Destroy the transfer snapshot the received stream recreated on the
+/// target (`<new dataset>@<snap>`). zfs-localpv has no record of it, so it
+/// would leak and pin every block the volume has since overwritten. Route
+/// the destroy through the target agent by registering a ZFSSnapshot CR for
+/// it (the agent's create is a no-op when the snapshot already exists) and
+/// then deleting the CR, whose zfs finalizer runs the `zfs destroy`.
+///
+/// Returns `None` once the snapshot is gone, otherwise the wait message.
+/// `target_snap_delete_issued` is set the moment the delete goes out so a
+/// CR that is simply gone is never re-registered; a crash between the
+/// delete and the status write costs one extra snapshot round trip and
+/// nothing else.
+async fn destroy_target_snapshot(
+    ctx: &Ctx,
+    evac_name: &str,
+    st: &mut ZFSEvacuationStatus,
+) -> Result<Option<String>> {
+    let (Some(t), Some(target)) = (st.transfer.clone(), st.target.clone()) else {
+        return Ok(None);
+    };
+    let snap_api: Api<ZFSSnapshot> = ctx.openebs();
+    let existing = snap_api.get_opt(&t.snap_name).await?;
+
+    if t.target_snap_delete_issued {
+        return match existing {
+            None => Ok(None),
+            Some(_) => {
+                strip_zfs_finalizer_if_node_gone(ctx, &snap_api, &t.snap_name, &target.node_id)
+                    .await?;
+                Ok(Some("waiting for target transfer snapshot destruction".into()))
+            }
+        };
+    }
+
+    match existing {
+        None => {
+            let zv_api: Api<ZFSVolume> = ctx.openebs();
+            let Some(zv) = zv_api.get_opt(&target.new_volume_handle).await? else {
+                // The new volume is already being torn down (PV released);
+                // its snapshots go with the dataset.
+                return Ok(None);
+            };
+            let snap = target_snapshot_cr(&target, &t.snap_name, zv.spec.0.clone());
+            tracing::info!(evac = evac_name, snap = t.snap_name, "registering target transfer snapshot");
+            create_if_absent(&snap_api, &snap).await?;
+            Ok(Some("registering target transfer snapshot".into()))
+        }
+        Some(cr) if cr.meta().deletion_timestamp.is_some() => {
+            mark_target_snap_delete_issued(ctx, evac_name, st).await?;
+            Ok(Some("waiting for target transfer snapshot destruction".into()))
+        }
+        // The agent adds its finalizer in the same update that sets Ready;
+        // deleting before that would let the CR vanish without a destroy.
+        Some(cr) if cr.finalizers().iter().any(|f| f == ZFS_FINALIZER) => {
+            snap_api.delete(&t.snap_name, &DeleteParams::default()).await?;
+            mark_target_snap_delete_issued(ctx, evac_name, st).await?;
+            Ok(Some("waiting for target transfer snapshot destruction".into()))
+        }
+        Some(_) => {
+            // Unprocessed, no finalizer: if the node that should process it
+            // is gone the dataset is too — drop the bare CR.
+            if node_by_id(&ctx.nodes(), &target.node_id).await?.is_none() {
+                tracing::warn!(evac = evac_name, "target node gone; dropping unprocessed snapshot CR");
+                snap_api.delete(&t.snap_name, &DeleteParams::default()).await?;
+                mark_target_snap_delete_issued(ctx, evac_name, st).await?;
+            }
+            Ok(Some("waiting for target agent to register transfer snapshot".into()))
+        }
+    }
+}
+
+async fn mark_target_snap_delete_issued(
+    ctx: &Ctx,
+    evac_name: &str,
+    st: &mut ZFSEvacuationStatus,
+) -> Result<()> {
+    if let Some(t) = st.transfer.as_mut() {
+        t.target_snap_delete_issued = true;
+    }
+    ctx.write_status(evac_name, st).await
+}
+
 async fn start_attempt(
     ctx: &Ctx,
     evac: &ZFSEvacuation,
@@ -821,6 +922,7 @@ async fn start_attempt(
         bytes_relayed: None,
         started_at: Some(now_rfc3339()),
         failure_reason: None,
+        target_snap_delete_issued: false,
     });
     st.message = Some(format!("transfer attempt {attempt} starting"));
     ctx.write_status(&name, st).await?;
@@ -982,7 +1084,14 @@ async fn cleaning_up(
             return wait(ctx, &name, st, "waiting for transfer CRs to clean up", 10).await;
         }
 
-    // 2. Old ZFSVolume: issue delete, then drop our guard so the agent's
+    // 2. The received stream recreated the transfer snapshot on the target
+    //    (`<new dataset>@<snap>`); nothing else knows it exists. Destroy it
+    //    before the source goes away, so a stuck target leaves both copies.
+    if let Some(msg) = destroy_target_snapshot(ctx, &name, st).await? {
+        return wait(ctx, &name, st, msg, 5).await;
+    }
+
+    // 3. Old ZFSVolume: issue delete, then drop our guard so the agent's
     //    destroy proceeds. Crash between the two resumes unambiguously
     //    (deletionTimestamp set + guard present -> remove guard).
     let zv_api: Api<ZFSVolume> = ctx.openebs();
@@ -1001,7 +1110,7 @@ async fn cleaning_up(
         return wait(ctx, &name, st, "waiting for source dataset destruction", 10).await;
     }
 
-    // 3. Unlock.
+    // 4. Unlock.
     if let Some(pvc_ref) = &st.pvc_ref {
         let key = format!("{}/{}", pvc_ref.namespace, pvc_ref.name);
         ctx.update_params(|keys| {
@@ -1021,7 +1130,7 @@ async fn cleaning_up(
             .await;
     }
 
-    // 4. Make sure the replacement PV does not carry the evacuate trigger
+    // 5. Make sure the replacement PV does not carry the evacuate trigger
     //    (an old stored manifest might), or deleting this CR would restart
     //    the whole evacuation.
     if let Some(pv) = ctx.pvs().get_opt(&evac.spec.pv_name).await?
