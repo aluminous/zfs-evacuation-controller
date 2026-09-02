@@ -777,6 +777,11 @@ pub fn target_snapshot_cr(
     info.pool_name = target.pool.clone();
     info.snapname = None;
     let mut snap = ZFSSnapshot::new(snap_name, crate::crd::openebs::ZFSSnapshotSpec(info));
+    // The CRD requires status on create; anything but Ready makes the agent
+    // run its (idempotent) create and then mark it Ready with its finalizer.
+    snap.status = Some(ZFSVolumeStatus {
+        state: Some(ZFS_STATUS_PENDING.to_string()),
+    });
     let labels = snap.meta_mut().labels.get_or_insert_with(Default::default);
     labels.insert("kubernetes.io/nodename".into(), target.node_id.clone());
     labels.insert(ZFS_VOL_LABEL.into(), target.new_volume_handle.clone());

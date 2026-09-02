@@ -81,7 +81,8 @@ pub struct ZFSVolumeSpec(pub VolumeInfo);
     kind = "ZFSSnapshot",
     plural = "zfssnapshots",
     namespaced,
-    schema = "disabled"
+    schema = "disabled",
+    status = "ZFSVolumeStatus"
 )]
 #[serde(transparent)]
 pub struct ZFSSnapshotSpec(pub VolumeInfo);

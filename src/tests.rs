@@ -215,6 +215,8 @@ fn target_snapshot_cr_addresses_received_snapshot() {
     assert_eq!(snap.spec.0.owner_node_id, "node2-id");
     assert_eq!(snap.spec.0.pool_name, "zroot/csi");
     assert_eq!(snap.spec.0.snapname, None);
+    // The CRD rejects a create without status.
+    assert_eq!(snap.status.as_ref().and_then(|s| s.state.as_deref()), Some("Pending"));
     // CRD-required fields and unmodeled properties ride along.
     assert_eq!(snap.spec.0.capacity.as_deref(), Some("10737418240"));
     assert_eq!(snap.spec.0.volume_type.as_deref(), Some("DATASET"));
