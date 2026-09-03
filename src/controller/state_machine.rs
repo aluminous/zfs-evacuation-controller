@@ -484,24 +484,35 @@ pub async fn blocking_reason(
     st: &ZFSEvacuationStatus,
     pods: &[Pod],
 ) -> Result<Option<String>> {
-    if pods.is_empty() {
-        return Ok(None);
-    }
     if evac.spec.mode == EvacuationMode::WhenIdle {
-        return Ok(Some(crate::controller::blocking_pods_message(pods)));
+        return Ok(if pods.is_empty() {
+            None
+        } else {
+            Some(crate::controller::blocking_pods_message(pods))
+        });
     }
+    // WhenClaimed. A scheduled pod always blocks.
     let scheduled: Vec<Pod> = pods.iter().filter(|p| pod_is_scheduled(p)).cloned().collect();
     if !scheduled.is_empty() {
         return Ok(Some(crate::controller::blocking_pods_message(&scheduled)));
     }
+    // The cordon is required even with ZERO pods: claimablePvcKeys admits any
+    // scheduler-routed pod, so a consumer created at any point mid-copy would
+    // be pinned to the source by PV affinity and land there the moment the
+    // node is schedulable. Only the node's own state closes that door.
     if source_repels_pods(ctx, st).await? {
         return Ok(None);
     }
-    Ok(Some(format!(
-        "consumer {} is waiting for this volume, but the source node is still schedulable; \
-         cordon it (kubectl cordon) so the pod cannot land there mid-copy",
-        pod_names(pods).join(", ")
-    )))
+    Ok(Some(match pods.is_empty() {
+        true => "the source node is still schedulable; cordon it (kubectl cordon) or taint it \
+                 with a NoSchedule effect so no consumer can land there mid-copy"
+            .to_string(),
+        false => format!(
+            "consumer {} is waiting for this volume, but the source node is still schedulable; \
+             cordon it (kubectl cordon) so the pod cannot land there mid-copy",
+            pod_names(pods).join(", ")
+        ),
+    }))
 }
 
 async fn target_selecting(

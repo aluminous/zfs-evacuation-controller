@@ -169,6 +169,18 @@ pub async fn swapping(
         // the provisioner has no volume deletion to perform).
         Some(pv) if pv.uid().as_deref() == Some(source.pv_uid.as_str()) => {
             if pv.meta().deletion_timestamp.is_none() {
+                // Re-verify right up against the delete: an uncordon after
+                // Committing's check would let the scheduler bind the Pending
+                // consumer to the source through the old PV's nodeAffinity in
+                // exactly this window. Checking here (same reconcile, no
+                // status write in between) shrinks the check-then-act gap to
+                // the API round-trip; once the delete is issued the affinity
+                // target is going away and holding no longer helps.
+                let pods =
+                    pods_referencing_pvc(&ctx.pods(&pvc_ref.namespace), &pvc_ref.name).await?;
+                if let Some(msg) = blocking_reason(ctx, evac, st, &pods).await? {
+                    return wait(ctx, &name, st, msg, 10).await;
+                }
                 pv_api.delete(&evac.spec.pv_name, &DeleteParams::default()).await?;
             }
             set_finalizers(&pv_api, &evac.spec.pv_name, |cur| {
