@@ -10,9 +10,9 @@ use kube::runtime::controller::Action;
 use kube::{Resource, ResourceExt};
 use serde_json::json;
 
-use crate::controller::state_machine::{
-    cleanup_transfer_crs, create_if_absent, remove_evac_finalizer, rst_name, set_finalizers,
-    strip_zfs_finalizer_if_node_gone,
+use crate::controller::state_machine::{remove_evac_finalizer, set_finalizers};
+use crate::controller::transfer::{
+    cleanup_transfer_crs, create_if_absent, rst_name, strip_zfs_finalizer_if_node_gone,
 };
 use crate::controller::Ctx;
 use crate::crd::openebs::{

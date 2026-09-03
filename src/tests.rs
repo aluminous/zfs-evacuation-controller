@@ -187,7 +187,7 @@ fn destination_poolname_resolution() {
 
 #[test]
 fn target_snapshot_cr_addresses_received_snapshot() {
-    use crate::controller::state_machine::target_snapshot_cr;
+    use crate::controller::transfer::target_snapshot_cr;
     use crate::crd::openebs::{VolumeInfo, ZFS_VOL_LABEL};
     use kube::ResourceExt;
     // The agent on the target builds `<poolName>/<ZFS_VOL_LABEL>@<name>` and
@@ -225,9 +225,7 @@ fn target_snapshot_cr_addresses_received_snapshot() {
 }
 
 mod transfer_verdict {
-    use crate::controller::state_machine::{
-        transfer_verdict, RelayObs, TransferObs, TransferVerdict,
-    };
+    use crate::controller::transfer::{transfer_verdict, RelayObs, TransferObs, TransferVerdict};
 
     fn obs() -> TransferObs {
         TransferObs {
