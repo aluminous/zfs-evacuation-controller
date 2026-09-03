@@ -133,7 +133,9 @@ kubectl delete pod -n "$NS" reader --wait
 
 # ---------------------------------------------------------------------------
 # test 4: WhenClaimed — taint + drain moves a consumer's volumes together and
-# the *same* Pending pod binds them on the new node (no delete/recreate).
+# the *same* Pending pod binds them on the new node (no delete/recreate). A
+# consumer-less volume on the same node is WhenClaimed too, holds until the
+# node repels pods, and then moves on its own.
 # ---------------------------------------------------------------------------
 NODE2_ID=$(pv_node_id "$PV")
 NODE2=$(node_name_for_id "$NODE2_ID")
@@ -175,11 +177,47 @@ PV2=$(kubectl get pvc -n "$NS" data2 -o jsonpath='{.spec.volumeName}')
 [ "$(pv_node_id "$PV2")" = "$NODE2_ID" ] || fail "data2 was not provisioned on $NODE2"
 OLD_UID=$(kubectl get pod -n "$NS" -l app=app -o jsonpath='{.items[0].metadata.uid}')
 
-log "test 4: taint $NODE2 (lock), then drain it (consumer goes Pending)"
+log "test 4 setup: a third, consumer-less PVC on $NODE2"
+kubectl apply -n "$NS" -f - <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: idle }
+spec:
+  storageClassName: $SC
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: idle-writer }
+spec:
+  restartPolicy: Never
+  nodeSelector: { kubernetes.io/hostname: $NODE2 }
+  containers:
+    - name: w
+      image: busybox
+      command: ["sh", "-c", "echo idle > /data/idle && sync"]
+      volumeMounts: [{ name: d, mountPath: /data }]
+  volumes: [{ name: d, persistentVolumeClaim: { claimName: idle } }]
+EOF
+wait_for 120 "idle-writer completion" \
+  bash -c "kubectl get pod -n $NS idle-writer -o jsonpath='{.status.phase}' | grep -q Succeeded"
+kubectl delete pod -n "$NS" idle-writer --wait
+PV3=$(kubectl get pvc -n "$NS" idle -o jsonpath='{.spec.volumeName}')
+[ "$(pv_node_id "$PV3")" = "$NODE2_ID" ] || fail "idle was not provisioned on $NODE2"
+
+log "test 4: taint $NODE2 softly (lock only); nothing may copy while it still takes pods"
 kubectl taint node "$NODE2" "$TAINT=true:PreferNoSchedule"
 TAINTED_NODE=$NODE2
-wait_for 60 "both ZFSEvacuations locked (WhenClaimed)" bash -c \
-  "[ \"\$(kubectl get zfsevacuation $PV $PV2 -o jsonpath='{range .items[*]}{.spec.mode}/{.status.lockedAt}{\"\n\"}{end}' | grep -c '^WhenClaimed/20')\" = 2 ]"
+wait_for 60 "all three ZFSEvacuations locked (WhenClaimed)" bash -c \
+  "[ \"\$(kubectl get zfsevacuation $PV $PV2 $PV3 -o jsonpath='{range .items[*]}{.spec.mode}/{.status.lockedAt}{\"\n\"}{end}' | grep -c '^WhenClaimed/20')\" = 3 ]"
+wait_for 60 "consumer-less evacuation held for the cordon" bash -c \
+  "kubectl get zfsevacuation $PV3 -o jsonpath='{.status.phase} {.status.message}' | grep -q 'Quiescing .*still schedulable'"
+sleep 20
+[ "$(kubectl get zfsevacuation "$PV3" -o jsonpath='{.status.phase}')" = Quiescing ] \
+  || fail "consumer-less WhenClaimed evacuation advanced without a cordon"
+
+log "test 4: drain $NODE2 (consumer goes Pending; the node now repels pods)"
 kubectl drain "$NODE2" --ignore-daemonsets --delete-emptydir-data --timeout=120s
 wait_for 60 "replacement pod Pending" bash -c \
   "kubectl get pod -n $NS -l app=app -o jsonpath='{.items[0].status.phase}' | grep -q Pending"
@@ -193,13 +231,17 @@ if kubectl run -n "$NS" bypass --image=busybox --restart=Never \
   fail "pod with spec.nodeName referencing a claimable PVC was admitted"
 fi
 
-log "test 4: both evacuations complete to the same node"
-wait_for 1200 "both evacuations Completed" bash -c \
-  "[ \"\$(kubectl get zfsevacuation $PV $PV2 -o jsonpath='{range .items[*]}{.status.phase}{\"\n\"}{end}' | grep -c Completed)\" = 2 ]"
+log "test 4: all three evacuations complete; the consumer's two to the same node"
+wait_for 1800 "all three evacuations Completed" bash -c \
+  "[ \"\$(kubectl get zfsevacuation $PV $PV2 $PV3 -o jsonpath='{range .items[*]}{.status.phase}{\"\n\"}{end}' | grep -c Completed)\" = 3 ]"
 T1=$(kubectl get zfsevacuation "$PV" -o jsonpath='{.status.target.nodeId}')
 T2=$(kubectl get zfsevacuation "$PV2" -o jsonpath='{.status.target.nodeId}')
+T3=$(kubectl get zfsevacuation "$PV3" -o jsonpath='{.status.target.nodeId}')
 [ "$T1" = "$T2" ] || fail "volumes split across nodes: $PV -> $T1, $PV2 -> $T2"
 [ "$T1" != "$NODE2_ID" ] || fail "volumes did not leave $NODE2"
+[ "$T3" != "$NODE2_ID" ] || fail "consumer-less volume did not leave $NODE2"
+[ -z "$(kubectl get zfsevacuation "$PV3" -o jsonpath='{.status.colocation}')" ] \
+  || fail "consumer-less volume resolved a co-location group"
 ROLES=$(kubectl get zfsevacuation "$PV" "$PV2" -o jsonpath='{range .items[*]}{.status.colocation.role}{" "}{end}')
 case "$ROLES" in *Leader*Follower*|*Follower*Leader*) ;; *) fail "unexpected colocation roles: '$ROLES'";; esac
 
