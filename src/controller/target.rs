@@ -103,22 +103,30 @@ pub async fn select_target(ctx: &Ctx, input: &SelectionInput<'_>) -> Result<Targ
             continue;
         }
         let Some(st) = &e.status else { continue };
-        if matches!(st.phase, Phase::Completed | Phase::Failed) {
+        // Failed evacuations reserve nothing (their target never kept data).
+        if st.phase == Phase::Failed {
             continue;
         }
+        let completed = st.phase == Phase::Completed;
         if let Some(t) = &st.target {
-            busy_targets.insert(t.node_id.clone());
-            // Reserve the evacuating volume's capacity against the target's
-            // zpool. status.target.pool may be a dataset path; capacity is a
+            // status.target.pool may be a dataset path; capacity is a
             // per-zpool quantity, so the ledger keys on the pool component.
             let slot = reserved
                 .entry((t.node_id.clone(), pool_component(&t.pool).to_string()))
                 .or_default();
-            *slot += capacity_of_evac(e);
-            // A co-location leader also holds its group's unplaced members;
-            // each member's reservation moves to its own evacuation the
-            // moment that one picks a target (and never counts against the
-            // member itself while it is choosing).
+            if !completed {
+                busy_targets.insert(t.node_id.clone());
+                *slot += capacity_of_evac(e);
+            }
+            // A co-location leader also holds its group's unplaced members —
+            // and keeps holding them AFTER it completes: busy_targets blocked
+            // the followers from selecting for the leader's whole active
+            // life, so releasing the group reservation at Completed would let
+            // an unrelated evacuation take the anchor node's space before any
+            // follower had a turn, wedging the anchored group forever. Each
+            // member's share moves to its own evacuation the moment that one
+            // picks a target (and never counts against the member itself
+            // while it is choosing).
             if let Some(c) = &st.colocation {
                 *slot += c
                     .members
