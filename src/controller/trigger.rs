@@ -3,13 +3,13 @@
 //!
 //! - Phase 1: a PV annotated `zfsevac.alumino.us/evacuate=true` — WhenIdle.
 //! - Phase 2: a node tainted with the evacuate taint key — every zfs-localpv
-//!   volume owned by that node is evacuated: WhenClaimed for volumes some
-//!   pod references at that moment (the drain to come will leave their
-//!   consumers Pending, and those consumers decide where the volumes go
-//!   together), WhenIdle for the rest (nothing to co-locate them with).
-//!   Both triggers lock the PVC immediately; the transfer waits for its
-//!   last pod to go. Nothing is evicted here: draining is the operator's
-//!   move, made after the lock.
+//!   volume owned by that node is evacuated, always WhenClaimed: a volume
+//!   with a consumer moves with it (the drain leaves the consumer Pending and
+//!   it decides where the group goes), and a volume without one simply
+//!   resolves no group and is placed on its own. Either way the node must
+//!   repel pods (cordon, or the taint itself with a hard effect) before any
+//!   copy starts. Both triggers lock the PVC immediately; nothing is evicted
+//!   here — draining is the operator's move, made after the lock.
 //!
 //! A periodic list (not a watch): a pure watcher misses the "ZFSEvacuation
 //! was deleted while the trigger condition remains" case — no event fires, so
@@ -19,11 +19,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use k8s_openapi::api::core::v1::{PersistentVolume, Pod};
+use k8s_openapi::api::core::v1::PersistentVolume;
 use kube::api::{Api, ListParams};
 use kube::ResourceExt;
 
-use crate::controller::{node_has_evacuate_taint, node_id_of, pod_references_pvc, Ctx};
+use crate::controller::{node_by_id, node_has_evacuate_taint, node_id_of, Ctx};
 use crate::crd::openebs::{ZFSVolume, ZFS_DRIVER};
 use crate::crd::zfs_evacuation::{
     EvacuationMode, EvacuationTrigger, Phase, ZFSEvacuation, ZFSEvacuationSpec,
@@ -47,14 +47,13 @@ async fn tick(ctx: &Ctx) -> anyhow::Result<()> {
 
     // Phase 1: annotated PVs.
     for pv in &pv_list {
-        if wants_evacuation(pv) && clear_for_creation(ctx, &pv.name_any()).await {
-            create_evacuation(
-                ctx,
-                &pv.name_any(),
-                EvacuationTrigger::Annotation,
-                EvacuationMode::WhenIdle,
-            )
-            .await;
+        let pv_name = pv.name_any();
+        if wants_evacuation(pv)
+            && clear_for_creation(ctx, &pv_name).await
+            && annotation_condition_fresh(ctx, &pv_name).await
+        {
+            create_evacuation(ctx, &pv_name, EvacuationTrigger::Annotation, EvacuationMode::WhenIdle)
+                .await;
         }
     }
 
@@ -79,7 +78,6 @@ async fn tick(ctx: &Ctx) -> anyhow::Result<()> {
         })
         .collect();
     let zv_api: Api<ZFSVolume> = ctx.openebs();
-    let mut pods_by_ns: HashMap<String, Vec<Pod>> = HashMap::new();
     for zv in zv_api.list(&ListParams::default()).await? {
         if !tainted_ids.contains(&zv.spec.0.owner_node_id) {
             continue;
@@ -90,37 +88,61 @@ async fn tick(ctx: &Ctx) -> anyhow::Result<()> {
             continue;
         };
         let pv_name = pv.name_any();
-        if !clear_for_creation(ctx, &pv_name).await {
-            continue;
+        if clear_for_creation(ctx, &pv_name).await
+            && taint_condition_fresh(ctx, &pv_name, &zv.name_any()).await
+        {
+            create_evacuation(ctx, &pv_name, EvacuationTrigger::NodeTaint, EvacuationMode::WhenClaimed)
+                .await;
         }
-        let mode = if pv_in_use(ctx, pv, &mut pods_by_ns).await? {
-            EvacuationMode::WhenClaimed
-        } else {
-            EvacuationMode::WhenIdle
-        };
-        create_evacuation(ctx, &pv_name, EvacuationTrigger::NodeTaint, mode).await;
     }
     Ok(())
 }
 
-/// Does any pod object reference the PV's claim right now? Pod lists are
-/// per namespace and cached for the tick.
-async fn pv_in_use(
-    ctx: &Ctx,
-    pv: &PersistentVolume,
-    pods_by_ns: &mut HashMap<String, Vec<Pod>>,
-) -> anyhow::Result<bool> {
-    let Some(claim) = pv.spec.as_ref().and_then(|s| s.claim_ref.as_ref()) else {
-        return Ok(false);
-    };
-    let (Some(ns), Some(pvc_name)) = (claim.namespace.as_deref(), claim.name.as_deref()) else {
-        return Ok(false);
-    };
-    if !pods_by_ns.contains_key(ns) {
-        let list = ctx.pods(ns).list(&ListParams::default()).await?;
-        pods_by_ns.insert(ns.to_string(), list.items);
+/// Fresh-read verification of the annotation condition, run between deleting
+/// a Completed CR and creating its successor: the tick's PV list can predate
+/// an evacuation's completion (which strips the annotation), and a create
+/// from that stale view would spawn a CR whose condition never held —
+/// destined to cancel into Failed and block the PV.
+async fn annotation_condition_fresh(ctx: &Ctx, pv_name: &str) -> bool {
+    match ctx.pvs().get_opt(pv_name).await {
+        Ok(Some(pv)) => wants_evacuation(&pv),
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(pv = pv_name, error = %e, "fresh annotation check failed");
+            false
+        }
     }
-    Ok(pods_by_ns[ns].iter().any(|p| pod_references_pvc(p, pvc_name)))
+}
+
+/// Fresh-read verification of the taint condition: the PV must still carry
+/// this volumeHandle (a completed evacuation changes it) and the volume's
+/// current owner node must still carry the evacuate taint.
+async fn taint_condition_fresh(ctx: &Ctx, pv_name: &str, handle: &str) -> bool {
+    let fresh = async {
+        let pv = ctx.pvs().get_opt(pv_name).await?;
+        let handle_matches = pv
+            .as_ref()
+            .and_then(|pv| pv.spec.as_ref()?.csi.as_ref())
+            .is_some_and(|csi| csi.volume_handle == handle);
+        if !handle_matches {
+            return Ok::<bool, anyhow::Error>(false);
+        }
+        let zv_api: Api<ZFSVolume> = ctx.openebs();
+        let Some(zv) = zv_api.get_opt(handle).await? else {
+            return Ok(false);
+        };
+        let Some(node) = node_by_id(&ctx.nodes(), &zv.spec.0.owner_node_id).await? else {
+            return Ok(false);
+        };
+        Ok(node_has_evacuate_taint(&node, &ctx.cfg.taint_key))
+    };
+    match fresh.await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(pv = pv_name, error = %e, "fresh taint check failed");
+            false
+        }
+    }
 }
 
 fn wants_evacuation(pv: &PersistentVolume) -> bool {
@@ -139,32 +161,31 @@ fn wants_evacuation(pv: &PersistentVolume) -> bool {
 }
 
 /// Should a ZFSEvacuation be created for this PV? False while one is in
-/// flight (or Failed), true when none exists or a Completed one was just
+/// flight, true when none exists or a replaceable terminal one was just
 /// removed to make room.
 async fn clear_for_creation(ctx: &Ctx, pv_name: &str) -> bool {
     let api: Api<ZFSEvacuation> = Api::all(ctx.client.clone());
     match api.get_opt(pv_name).await {
         Ok(Some(existing)) => {
-            // A Completed CR is a finished job keeping the per-PV name: the
-            // trigger firing again (the volume's new node tainted, a fresh
-            // annotation) is a new request, so replace it. Failed stays put —
-            // deleting it is the operator's retry gesture, and it must stay
-            // visible until then.
-            let done = existing
-                .status
-                .as_ref()
-                .is_some_and(|s| matches!(s.phase, Phase::Completed));
-            if !done {
+            // A Completed CR is a finished job keeping the per-PV name; a
+            // cancelled one records a withdrawn request. The trigger firing
+            // again is a new request, so both are replaceable. A genuinely
+            // Failed evacuation stays put — deleting it is the operator's
+            // retry gesture, and it must stay visible until then.
+            let replaceable = existing.status.as_ref().is_some_and(|s| {
+                s.phase == Phase::Completed || (s.phase == Phase::Failed && s.cancelled)
+            });
+            if !replaceable {
                 return false;
             }
             match api.delete(pv_name, &Default::default()).await {
                 Ok(_) => {
-                    tracing::info!(pv = pv_name, "replaced Completed ZFSEvacuation");
+                    tracing::info!(pv = pv_name, "replaced terminal ZFSEvacuation");
                     true
                 }
                 Err(kube::Error::Api(e)) if e.code == 404 => true,
                 Err(e) => {
-                    tracing::warn!(pv = pv_name, error = %e, "failed to delete Completed ZFSEvacuation");
+                    tracing::warn!(pv = pv_name, error = %e, "failed to delete terminal ZFSEvacuation");
                     false
                 }
             }

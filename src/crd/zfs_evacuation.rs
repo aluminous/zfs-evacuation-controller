@@ -238,6 +238,12 @@ pub struct ZFSEvacuationStatus {
     /// Set once the old PV delete has been issued; from here, roll-forward only.
     #[serde(default)]
     pub committed: bool,
+    /// This evacuation ended (or is ending) because its trigger condition was
+    /// withdrawn — annotation removed, taint removed, PVC gone. A cancelled
+    /// Failed CR is replaceable by the trigger; a genuinely failed one is not
+    /// (deleting it is the operator's retry gesture).
+    #[serde(default)]
+    pub cancelled: bool,
     #[serde(default)]
     pub transfer: Option<TransferStatus>,
     /// RFC3339 time the last referencing pod disappeared (settle-period anchor).

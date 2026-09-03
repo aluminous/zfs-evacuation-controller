@@ -56,9 +56,13 @@ kubectl apply -f deploy/crds.yaml -f deploy/rbac.yaml \
 # Trigger 1: annotate a PV to evacuate that one volume.
 kubectl annotate pv pvc-1234... zfsevac.alumino.us/evacuate=true
 
-# Trigger 2: taint a node (any effect) to evacuate ALL its zfs-localpv
-# volumes. A tainted node is also excluded as an evacuation target.
-kubectl taint node worker-3 zfsevac.alumino.us/evacuate=:PreferNoSchedule
+# Trigger 2: taint a node to evacuate ALL its zfs-localpv volumes. Use a
+# hard effect (NoSchedule/NoExecute): taint-triggered evacuations refuse to
+# copy while the source can still receive pods, and a hard taint satisfies
+# that by itself (so does kubectl cordon/drain). A softer effect triggers
+# too, but everything holds until the node repels pods. A tainted node is
+# also excluded as an evacuation target.
+kubectl taint node worker-3 zfsevac.alumino.us/evacuate=:NoSchedule
 
 kubectl get zfsevacuations        # short name: zevac
 ```
@@ -70,25 +74,28 @@ let the workload finish. The order matters: trigger first, evict second.
 An evacuation runs in one of two modes (`spec.mode`, read once when the lock
 is taken):
 
-- **WhenIdle** — the annotation trigger, and the taint trigger for volumes no
-  pod referenced at taint time. The transfer starts once the last pod
-  referencing the PVC is gone, and *no* pod may be created against it until
-  the volume has moved. A Deployment/StatefulSet replacement is denied at
-  creation and its controller retries until the swap, at which point the pod
-  lands on the new node. Volumes are placed independently — an emergency
-  mode that ignores co-location.
-- **WhenClaimed** — the taint trigger for volumes a pod referenced at taint
-  time. The intended sequence is taint, then `kubectl drain`: the evicted
-  consumer's replacement is created (the lock allows scheduler-routed pods)
-  and stays Pending, because PV affinity pins it to a cordoned node. That
+- **WhenIdle** — the annotation trigger. The transfer starts once the last
+  pod referencing the PVC is gone, and *no* pod may be created against it
+  until the volume has moved. A Deployment/StatefulSet replacement is denied
+  at creation and its controller retries until the swap, at which point the
+  pod lands on the new node. Volumes are placed independently — an emergency
+  mode that ignores co-location, and the only mode that needs no cordon.
+- **WhenClaimed** — the taint trigger, always. The intended sequence is
+  taint (hard effect), then `kubectl drain`: the evicted consumer's
+  replacement is created (the lock allows scheduler-routed pods) and stays
+  Pending, because PV affinity pins it to a node that repels pods. That
   Pending pod defines the group — all of its ZFS PVCs move to one node that
   satisfies the pod's nodeSelector/affinity/tolerations and has room for the
   lot (`status.colocation` records the pod, members, and which member led
   the placement) — and once the PVs are swapped the scheduler binds the same
-  pod there. The source must stay cordoned (or tainted NoSchedule/NoExecute)
-  from drain to completion; the evacuation holds in Quiescing/Committing
-  with a `status.message` asking for the cordon otherwise. Removing the
-  taint cancels, as always.
+  pod there. A volume with no consumer resolves no group and is placed on
+  its own. The source must repel pods (cordon, or the evacuate taint with a
+  NoSchedule/NoExecute effect) from before the copy to completion, **whether
+  or not any consumer exists** — the lock admits scheduler-routed pods, so
+  only the node's own state keeps a newly created consumer off the source
+  mid-copy. The evacuation holds in Quiescing/Committing/Swapping with a
+  `status.message` asking for the cordon otherwise. Removing the taint
+  cancels, as always.
 
 Do not trigger what you do not intend to drain: while a WhenIdle lock holds,
 a crashed consumer cannot restart until the migration completes.

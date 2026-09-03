@@ -64,6 +64,7 @@ pub async fn reconcile(evac: Arc<ZFSEvacuation>, ctx: Arc<Ctx>) -> Result<Action
         && let Some(reason) = cancel_reason(&ctx, &evac, &st).await? {
             tracing::info!(evac = name, reason, "aborting evacuation");
             st.phase = Phase::Aborting;
+            st.cancelled = true;
             st.message = Some(reason);
             ctx.write_status(&name, &st).await?;
             return Ok(Action::requeue(Duration::from_secs(1)));
