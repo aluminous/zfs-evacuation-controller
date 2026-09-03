@@ -78,7 +78,9 @@ pub struct Relay {
 /// Chunk size read from the source per syscall.
 const CHUNK: usize = 256 * 1024;
 /// How much of the send stream may be held in memory while the target has
-/// not connected yet (chunks × CHUNK). Sized against the pod's memory limit;
+/// not connected yet (chunks × CHUNK = 64 MiB). Keep chunks × CHUNK × the
+/// per-node concurrency ceiling (floor(nodes/2) concurrent streams) inside
+/// the deployment memory limit (256Mi in brick) with headroom;
 /// at direct-path speeds this covers several seconds of source flow, which
 /// is far longer than a ZFSRestore takes to turn into a connection.
 const BUFFER_CHUNKS: usize = 256;

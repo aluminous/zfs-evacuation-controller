@@ -224,6 +224,118 @@ fn target_snapshot_cr_addresses_received_snapshot() {
     assert_eq!(snap.spec.0.extra["recordsize"], "128k");
 }
 
+mod transfer_verdict {
+    use crate::controller::state_machine::{
+        transfer_verdict, RelayObs, TransferObs, TransferVerdict,
+    };
+
+    fn obs() -> TransferObs {
+        TransferObs {
+            attempt: 1,
+            failure_reason: None,
+            bkp_status: String::new(),
+            rst_status: String::new(),
+            rst_exists: false,
+            mem: Some(RelayObs {
+                attempt: 1,
+                bytes: 0,
+                last_activity: 1000,
+                task_finished: false,
+                source_connected: false,
+            }),
+            elapsed_secs: 10,
+            now_secs: 1000,
+            timeout_secs: 3600,
+            stall_secs: 120,
+        }
+    }
+
+    fn fail_reason(v: TransferVerdict) -> String {
+        match v {
+            TransferVerdict::FailAttempt(r) => r,
+            other => panic!("expected FailAttempt, got {other:?}"),
+        }
+    }
+
+    // Finding #9: Done/Done outranks a recorded failure_reason — a teardown
+    // that lost the race to the agents must salvage, not destroy.
+    #[test]
+    fn done_wins_over_failure_reason() {
+        let mut o = obs();
+        o.failure_reason = Some("controller restarted mid-transfer".into());
+        o.bkp_status = "Done".into();
+        o.rst_status = "Done".into();
+        o.mem = None;
+        assert_eq!(transfer_verdict(&o), TransferVerdict::Complete { bytes: None });
+    }
+
+    // Finding #4: an attempt stuck waiting for the source must hit the
+    // attempt timeout, not wait forever.
+    #[test]
+    fn waiting_for_source_times_out() {
+        let mut o = obs();
+        assert_eq!(transfer_verdict(&o), TransferVerdict::WaitingForSource);
+        o.elapsed_secs = o.timeout_secs + 1;
+        assert_eq!(fail_reason(transfer_verdict(&o)), "transfer timed out");
+    }
+
+    // Finding #5: a source that EOF'd into the buffer while the target is
+    // still dialing must NOT trip the stall detector; the timeout bounds it.
+    #[test]
+    fn slow_target_is_timeout_not_stall() {
+        let mut o = obs();
+        o.rst_exists = true;
+        let m = o.mem.as_mut().unwrap();
+        m.source_connected = true;
+        m.bytes = 0; // nothing delivered to the target yet
+        m.last_activity = 100; // frozen long ago (source EOF)
+        o.now_secs = 100 + 500; // way past stall_secs
+        assert!(matches!(transfer_verdict(&o), TransferVerdict::Continue { .. }));
+        o.elapsed_secs = o.timeout_secs + 1;
+        assert_eq!(fail_reason(transfer_verdict(&o)), "transfer timed out");
+    }
+
+    // A flowing stream that stops moving is a stall; a flowing stream never
+    // times out.
+    #[test]
+    fn flowing_stream_stalls_but_never_times_out() {
+        let mut o = obs();
+        o.rst_exists = true;
+        let m = o.mem.as_mut().unwrap();
+        m.source_connected = true;
+        m.bytes = 1 << 20;
+        m.last_activity = 990;
+        o.elapsed_secs = o.timeout_secs + 500; // long transfer, still moving
+        assert!(matches!(transfer_verdict(&o), TransferVerdict::Continue { .. }));
+        o.now_secs = 990 + 121;
+        assert_eq!(fail_reason(transfer_verdict(&o)), "transfer stalled (no bytes)");
+    }
+
+    #[test]
+    fn restart_and_staleness() {
+        let mut o = obs();
+        o.mem = None;
+        assert_eq!(fail_reason(transfer_verdict(&o)), "controller restarted mid-transfer");
+        let mut o = obs();
+        o.mem.as_mut().unwrap().attempt = 2;
+        assert_eq!(transfer_verdict(&o), TransferVerdict::StaleStatus);
+        let mut o = obs();
+        o.attempt = 3;
+        assert_eq!(transfer_verdict(&o), TransferVerdict::StaleRelay);
+    }
+
+    #[test]
+    fn agent_failure_and_restore_creation() {
+        let mut o = obs();
+        o.rst_status = "Failed".into();
+        o.rst_exists = true;
+        assert_eq!(fail_reason(transfer_verdict(&o)), "restore reported status Failed");
+        let mut o = obs();
+        o.mem.as_mut().unwrap().source_connected = true;
+        assert_eq!(transfer_verdict(&o), TransferVerdict::CreateRestore);
+    }
+}
+
 #[test]
 fn crd_generation_is_valid() {
     use kube::CustomResourceExt;

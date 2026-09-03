@@ -638,123 +638,181 @@ async fn transferring(
         return start_attempt(ctx, evac, st, 1).await;
     };
 
-    // An attempt already judged failed is only ever torn down; re-deriving a
-    // verdict from its half-deleted CRs and dropped relay would replace the
-    // real reason with a bogus one ("controller restarted").
-    if let Some(reason) = t.failure_reason.clone() {
-        return retry_or_fail(ctx, evac, st, &t, max_attempts, &reason).await;
-    }
-
-    // CR statuses come FIRST: a transfer that completed while we weren't
-    // looking (e.g. across a controller restart) must advance, not be torn
-    // down and re-copied.
     let bkp_api: Api<ZFSBackup> = ctx.openebs();
     let rst_api: Api<ZFSRestore> = ctx.openebs();
     let bkp = bkp_api.get_opt(&bkp_name(&name, t.attempt)).await?;
     let rst = rst_api.get_opt(&rst_name(&name, t.attempt)).await?;
-    let bkp_status = bkp.as_ref().and_then(|b| b.status.clone()).unwrap_or_default();
-    let rst_status = rst.as_ref().and_then(|r| r.status.clone()).unwrap_or_default();
 
     // Snapshot of in-memory relay state (guard dropped before any await).
     let mem = {
         let map = ctx.transfers.lock().unwrap();
-        map.get(&name).map(|t| {
-            (
-                t.attempt,
-                t.relay.bytes.load(std::sync::atomic::Ordering::Relaxed),
-                t.relay
-                    .last_activity
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                t.relay.task.is_finished(),
-                t.relay
-                    .source_connected
-                    .load(std::sync::atomic::Ordering::Acquire),
-            )
+        map.get(&name).map(|a| RelayObs {
+            attempt: a.attempt,
+            bytes: a.relay.bytes.load(std::sync::atomic::Ordering::Relaxed),
+            last_activity: a
+                .relay
+                .last_activity
+                .load(std::sync::atomic::Ordering::Relaxed),
+            task_finished: a.relay.task.is_finished(),
+            source_connected: a
+                .relay
+                .source_connected
+                .load(std::sync::atomic::Ordering::Acquire),
         })
     };
 
-    if bkp_status == BKP_STATUS_DONE && rst_status == BKP_STATUS_DONE {
-        drop_relay(ctx, &name);
-        if let Some((_, bytes, _, _, _)) = mem {
-            st.transfer.as_mut().unwrap().bytes_relayed = Some(bytes);
+    let obs = TransferObs {
+        attempt: t.attempt,
+        failure_reason: t.failure_reason.clone(),
+        bkp_status: bkp.as_ref().and_then(|b| b.status.clone()).unwrap_or_default(),
+        rst_status: rst.as_ref().and_then(|r| r.status.clone()).unwrap_or_default(),
+        rst_exists: rst.is_some(),
+        mem,
+        elapsed_secs: t.started_at.as_deref().and_then(secs_since).unwrap_or(0),
+        now_secs: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        timeout_secs: timeout,
+        stall_secs: ctx.cfg.stall_seconds,
+    };
+    match transfer_verdict(&obs) {
+        TransferVerdict::Complete { bytes } => {
+            drop_relay(ctx, &name);
+            if let Some(bytes) = bytes {
+                st.transfer.as_mut().unwrap().bytes_relayed = Some(bytes);
+            }
+            tracing::info!(evac = name, bytes = ?st.transfer.as_ref().and_then(|x| x.bytes_relayed), "transfer complete");
+            advance(ctx, &name, st, Phase::Adopting).await
         }
-        tracing::info!(evac = name, bytes = ?st.transfer.as_ref().and_then(|x| x.bytes_relayed), "transfer complete");
-        return advance(ctx, &name, st, Phase::Adopting).await;
+        TransferVerdict::FailAttempt(reason) => {
+            retry_or_fail(ctx, evac, st, &t, max_attempts, &reason).await
+        }
+        TransferVerdict::StaleStatus => Ok(Action::requeue(Duration::from_secs(2))),
+        TransferVerdict::StaleRelay => {
+            drop_relay(ctx, &name);
+            Ok(Action::requeue(Duration::from_secs(1)))
+        }
+        TransferVerdict::WaitingForSource => {
+            wait(ctx, &name, st, format!("transfer attempt {} waiting for source", t.attempt), 2)
+                .await
+        }
+        TransferVerdict::CreateRestore => {
+            create_restore(ctx, st, &name, t.attempt, t.ports.get(1).copied().unwrap_or(0))
+                .await?;
+            Ok(Action::requeue(Duration::from_secs(2)))
+        }
+        TransferVerdict::Continue { bytes } => {
+            if st.transfer.as_ref().and_then(|x| x.bytes_relayed) != Some(bytes) {
+                st.transfer.as_mut().unwrap().bytes_relayed = Some(bytes);
+                ctx.write_status(&name, st).await?;
+            }
+            Ok(Action::requeue(Duration::from_secs(10)))
+        }
     }
-    for (role, s) in [("backup", &bkp_status), ("restore", &rst_status)] {
+}
+
+/// Everything the transfer phase can observe about an attempt, gathered in
+/// one struct so the precedence between success, failure, staleness, the
+/// attempt timeout and the stall detector lives in exactly one (pure,
+/// testable) place: [`transfer_verdict`].
+pub struct TransferObs {
+    pub attempt: u32,
+    pub failure_reason: Option<String>,
+    pub bkp_status: String,
+    pub rst_status: String,
+    pub rst_exists: bool,
+    pub mem: Option<RelayObs>,
+    pub elapsed_secs: u64,
+    pub now_secs: u64,
+    pub timeout_secs: u64,
+    pub stall_secs: u64,
+}
+
+pub struct RelayObs {
+    pub attempt: u32,
+    /// Bytes DELIVERED TO THE TARGET (the relay counts drain-side writes),
+    /// so bytes > 0 implies the target is connected and receiving.
+    pub bytes: u64,
+    pub last_activity: u64,
+    pub task_finished: bool,
+    pub source_connected: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum TransferVerdict {
+    Complete { bytes: Option<u64> },
+    FailAttempt(String),
+    /// Status view older than the live relay: touch nothing.
+    StaleStatus,
+    /// Relay older than the recorded attempt: drop it.
+    StaleRelay,
+    WaitingForSource,
+    CreateRestore,
+    Continue { bytes: u64 },
+}
+
+pub fn transfer_verdict(o: &TransferObs) -> TransferVerdict {
+    // Success wins over everything, a recorded failure_reason included: a
+    // teardown that loses the race against the agents' Done flips must
+    // salvage the received data, not destroy it.
+    if o.bkp_status == BKP_STATUS_DONE && o.rst_status == BKP_STATUS_DONE {
+        return TransferVerdict::Complete { bytes: o.mem.as_ref().map(|m| m.bytes) };
+    }
+    // An attempt already judged failed is only ever torn down; re-deriving a
+    // verdict from its half-deleted CRs and dropped relay would replace the
+    // real reason with a bogus one ("controller restarted").
+    if let Some(r) = &o.failure_reason {
+        return TransferVerdict::FailAttempt(r.clone());
+    }
+    for (role, s) in [("backup", &o.bkp_status), ("restore", &o.rst_status)] {
         if s == BKP_STATUS_FAILED || s == BKP_STATUS_INVALID {
-            return retry_or_fail(
-                ctx,
-                evac,
-                st,
-                &t,
-                max_attempts,
-                &format!("{role} reported status {s}"),
-            )
-            .await;
+            return TransferVerdict::FailAttempt(format!("{role} reported status {s}"));
         }
     }
-    let Some((mem_attempt, bytes, last_activity, task_finished, source_connected)) = mem else {
+    let Some(m) = &o.mem else {
         // A recorded, non-terminal attempt with no live relay: the controller
         // restarted mid-transfer. Invalidate the attempt.
-        return retry_or_fail(ctx, evac, st, &t, max_attempts, "controller restarted mid-transfer")
-            .await;
+        return TransferVerdict::FailAttempt("controller restarted mid-transfer".into());
     };
     // Reconciles can carry a STALE cached status (an event older than our own
     // last write). A live relay newer than the status view must never be
     // killed — that cascades into burning every attempt. Only a relay OLDER
     // than the recorded attempt is stale and safe to drop.
-    if mem_attempt > t.attempt {
-        return Ok(Action::requeue(Duration::from_secs(2)));
+    if m.attempt > o.attempt {
+        return TransferVerdict::StaleStatus;
     }
-    if mem_attempt < t.attempt {
-        drop_relay(ctx, &name);
-        return Ok(Action::requeue(Duration::from_secs(1)));
+    if m.attempt < o.attempt {
+        return TransferVerdict::StaleRelay;
     }
-
+    // One clock bounds every non-flowing state: waiting for the source,
+    // waiting for the target (including a source that already EOF'd into the
+    // buffer), and the agents' post-stream finalization. Only a stream
+    // actually delivering bytes to the target is exempt — tearing down a
+    // progressing transfer only to restart it from zero can never finish.
+    let flowing = !m.task_finished && m.bytes > 0;
+    if !flowing && o.elapsed_secs > o.timeout_secs {
+        return TransferVerdict::FailAttempt("transfer timed out".into());
+    }
     // The target is dialed only once the source is connected and flowing:
     // the agents' `nc -w 3` closes any connection idle for 3 s, so a target
     // that connects before the source has bytes dies before the stream
     // starts (and burns an attempt in exactly 3 s).
-    if rst.is_none() {
-        if !source_connected {
-            return wait(ctx, &name, st, format!("transfer attempt {} waiting for source", t.attempt), 2)
-                .await;
-        }
-        create_restore(ctx, st, &name, t.attempt, t.ports.get(1).copied().unwrap_or(0)).await?;
-        return Ok(Action::requeue(Duration::from_secs(2)));
+    if !o.rst_exists {
+        return if m.source_connected {
+            TransferVerdict::CreateRestore
+        } else {
+            TransferVerdict::WaitingForSource
+        };
     }
-
-    // Stall detection only applies while the stream is live: once the relay
-    // task has finished, all bytes are delivered and we're waiting on the
-    // agents' status flips (recv finalization can legitimately take a while;
-    // the per-attempt timeout bounds it).
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if !task_finished && now.saturating_sub(last_activity) > ctx.cfg.stall_seconds {
-        return retry_or_fail(ctx, evac, st, &t, max_attempts, "transfer stalled (no bytes)")
-            .await;
+    // Stall detection applies only to a flowing stream (bytes reaching the
+    // target) that stops moving. Before the target connects, last_activity
+    // freezes at the source's EOF / full buffer — that state belongs to the
+    // attempt timeout above, not to the stall detector.
+    if flowing && o.now_secs.saturating_sub(m.last_activity) > o.stall_secs {
+        return TransferVerdict::FailAttempt("transfer stalled (no bytes)".into());
     }
-
-    // The attempt timeout bounds everything EXCEPT a flowing stream: time to
-    // the first byte and the agents' post-stream finalization. A slow link
-    // is not a failure — tearing down a progressing transfer only to restart
-    // it from zero can never finish — and the stall detector above already
-    // guards a stream that stops moving.
-    let elapsed = t.started_at.as_deref().and_then(secs_since).unwrap_or(0);
-    let flowing = !task_finished && bytes > 0;
-    if !flowing && elapsed > timeout {
-        return retry_or_fail(ctx, evac, st, &t, max_attempts, "transfer timed out").await;
-    }
-
-    // Progress heartbeat.
-    if st.transfer.as_ref().and_then(|x| x.bytes_relayed) != Some(bytes) {
-        st.transfer.as_mut().unwrap().bytes_relayed = Some(bytes);
-        ctx.write_status(&name, st).await?;
-    }
-    Ok(Action::requeue(Duration::from_secs(10)))
+    TransferVerdict::Continue { bytes: m.bytes }
 }
 
 fn drop_relay(ctx: &Ctx, name: &str) {
