@@ -19,8 +19,7 @@ use crate::controller::{
     DEFAULT_TRANSFER_TIMEOUT, LOCK_PROPAGATION_SECONDS,
 };
 use crate::crd::openebs::{
-    VolumeInfo, ZFSBackup, ZFSBackupSpec, ZFSRestore, ZFSRestoreSpec, ZFSSnapshot, ZFSVolume,
-    ZFSVolumeSpec, ZFSVolumeStatus, BKP_STATUS_DONE, BKP_STATUS_FAILED, BKP_STATUS_INIT,
+    VolumeInfo, ZFSBackup, ZFSBackupSpec, ZFSRestore, ZFSRestoreSpec, ZFSSnapshot, ZFSVolume, ZFSVolumeStatus, BKP_STATUS_DONE, BKP_STATUS_FAILED, BKP_STATUS_INIT,
     BKP_STATUS_INVALID, MARKED_FOR_DELETION, ZFS_DRIVER, ZFS_FINALIZER, ZFS_STATUS_PENDING,
     ZFS_STATUS_READY, ZFS_VOL_LABEL,
 };
@@ -920,11 +919,9 @@ where
 pub fn target_snapshot_cr(
     target: &crate::crd::zfs_evacuation::TargetInfo,
     snap_name: &str,
-    mut info: VolumeInfo,
+    info: VolumeInfo,
 ) -> ZFSSnapshot {
-    info.owner_node_id = target.node_id.clone();
-    info.pool_name = target.pool.clone();
-    info.snapname = None;
+    let info = crate::controller::adapt_to_target(info, target);
     let mut snap = ZFSSnapshot::new(snap_name, crate::crd::openebs::ZFSSnapshotSpec(info));
     // The CRD requires status on create; anything but Ready makes the agent
     // run its (idempotent) create and then mark it Ready with its finalizer.
@@ -1115,10 +1112,7 @@ async fn create_restore(
         .get_opt(&source.volume_handle)
         .await?
         .ok_or_else(|| anyhow!("source ZFSVolume disappeared"))?;
-    let mut vol_spec: VolumeInfo = zv.spec.0.clone();
-    vol_spec.owner_node_id = target.node_id.clone();
-    vol_spec.pool_name = target.pool.clone();
-    vol_spec.snapname = None;
+    let vol_spec: VolumeInfo = crate::controller::adapt_to_target(zv.spec.0.clone(), &target);
 
     let rst_api: Api<ZFSRestore> = ctx.openebs();
     let mut rst = ZFSRestore::new(
@@ -1191,19 +1185,7 @@ async fn adopting(
                 .get_opt(&source.volume_handle)
                 .await?
                 .ok_or_else(|| anyhow!("source ZFSVolume disappeared"))?;
-            let mut info = src.spec.0.clone();
-            info.owner_node_id = target.node_id.clone();
-            info.pool_name = target.pool.clone();
-            info.snapname = None;
-            let mut zv = ZFSVolume::new(&target.new_volume_handle, ZFSVolumeSpec(info));
-            // The node agent lists its volumes by this label.
-            zv.meta_mut()
-                .labels
-                .get_or_insert_with(Default::default)
-                .insert("kubernetes.io/nodename".into(), target.node_id.clone());
-            zv.status = Some(ZFSVolumeStatus {
-                state: Some(ZFS_STATUS_PENDING.to_string()),
-            });
+            let zv = crate::controller::target_zfsvolume(src.spec.0.clone(), &target);
             create_if_absent(&zv_api, &zv).await?;
             Ok(Action::requeue(Duration::from_secs(3)))
         }

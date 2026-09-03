@@ -53,6 +53,45 @@ pub struct Config {
     pub taint_key: String,
 }
 
+/// zfs-localpv addresses a CR to a node through three things at once: the
+/// spec's ownerNodeID/poolName (with no clone origin), the
+/// `kubernetes.io/nodename` label its informers select on, and a non-Ready
+/// status that makes the agent run its (idempotent) create. Every
+/// target-side CR — ZFSVolume, ZFSSnapshot, a restore's volSpec — must agree
+/// on the spec part, and the constructors below on all three; this is the
+/// single place that knowledge lives.
+pub fn adapt_to_target(
+    mut info: crate::crd::openebs::VolumeInfo,
+    target: &crate::crd::zfs_evacuation::TargetInfo,
+) -> crate::crd::openebs::VolumeInfo {
+    info.owner_node_id = target.node_id.clone();
+    info.pool_name = target.pool.clone();
+    info.snapname = None;
+    info
+}
+
+/// The ZFSVolume CR for the received dataset on the target (used both to
+/// adopt it and, on abort, to route its destruction through the agent).
+pub fn target_zfsvolume(
+    info: crate::crd::openebs::VolumeInfo,
+    target: &crate::crd::zfs_evacuation::TargetInfo,
+) -> crate::crd::openebs::ZFSVolume {
+    use crate::crd::openebs::{ZFSVolume, ZFSVolumeSpec, ZFSVolumeStatus, ZFS_STATUS_PENDING};
+    use kube::Resource as _;
+    let mut zv = ZFSVolume::new(
+        &target.new_volume_handle,
+        ZFSVolumeSpec(adapt_to_target(info, target)),
+    );
+    zv.meta_mut()
+        .labels
+        .get_or_insert_with(Default::default)
+        .insert("kubernetes.io/nodename".into(), target.node_id.clone());
+    zv.status = Some(ZFSVolumeStatus {
+        state: Some(ZFS_STATUS_PENDING.to_string()),
+    });
+    zv
+}
+
 /// Does the node carry the evacuate taint (any effect)?
 pub fn node_has_evacuate_taint(node: &Node, taint_key: &str) -> bool {
     node.spec

@@ -16,7 +16,7 @@ use crate::controller::state_machine::{
 };
 use crate::controller::Ctx;
 use crate::crd::openebs::{
-    ZFSRestore, ZFSVolume, ZFSVolumeSpec, ZFSVolumeStatus, BKP_STATUS_DONE, ZFS_STATUS_PENDING,
+    ZFSRestore, ZFSVolume, BKP_STATUS_DONE,
 };
 use crate::crd::zfs_evacuation::{
     Phase, ZFSEvacuation, ZFSEvacuationStatus, EVACUATING_LABEL, GUARD_FINALIZER,
@@ -73,19 +73,7 @@ pub async fn run(
                 // create-then-delete so the agent adopts and destroys it.
                 let src = st.source.clone().ok_or_else(|| anyhow!("no source recorded"))?;
                 if let Some(src_zv) = zv_api.get_opt(&src.volume_handle).await? {
-                    let mut info = src_zv.spec.0.clone();
-                    info.owner_node_id = target.node_id.clone();
-                    info.pool_name = target.pool.clone();
-                    info.snapname = None;
-                    let mut zv =
-                        ZFSVolume::new(&target.new_volume_handle, ZFSVolumeSpec(info));
-                    zv.meta_mut()
-                        .labels
-                        .get_or_insert_with(Default::default)
-                        .insert("kubernetes.io/nodename".into(), target.node_id.clone());
-                    zv.status = Some(ZFSVolumeStatus {
-                        state: Some(ZFS_STATUS_PENDING.to_string()),
-                    });
+                    let zv = crate::controller::target_zfsvolume(src_zv.spec.0.clone(), &target);
                     create_if_absent(&zv_api, &zv).await?;
                     return requeue_msg(ctx, &name, st, "abort: adopting orphan dataset for destruction")
                         .await;
