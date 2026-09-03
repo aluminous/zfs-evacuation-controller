@@ -7,6 +7,7 @@ set -euo pipefail
 
 NS=e2e-zevac
 SC=${STORAGE_CLASS:-zfs}
+POOL=${ZFS_POOL:-tank}   # dataset parent the StorageClass provisions under
 NODE1_SSH=${NODE1_SSH:?set NODE1_SSH to a command prefix that runs on node 1}
 NODE2_SSH=${NODE2_SSH:?set NODE2_SSH to a command prefix that runs on node 2}
 
@@ -21,8 +22,10 @@ wait_for() { # <timeout-secs> <description> <command...>
 
 TAINT=zfsevac.alumino.us/evacuate
 TAINTED_NODE=
+OLD_HANDLE=
 cleanup() {
   kubectl delete ns "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  [ -z "$OLD_HANDLE" ] || $NODE2_SSH sudo zfs destroy "$POOL/${OLD_HANDLE}-collision" >/dev/null 2>&1 || true
   if [ -n "$TAINTED_NODE" ]; then
     kubectl taint node "$TAINTED_NODE" "$TAINT-" >/dev/null 2>&1 || true
     kubectl uncordon "$TAINTED_NODE" >/dev/null 2>&1 || true
@@ -64,6 +67,10 @@ wait_for 120 "writer pod completion" \
   bash -c "kubectl get pod -n $NS writer -o jsonpath='{.status.phase}' | grep -q Succeeded"
 PV=$(kubectl get pvc -n "$NS" data -o jsonpath='{.spec.volumeName}')
 OLD_HANDLE=$(kubectl get pv "$PV" -o jsonpath='{.spec.csi.volumeHandle}')
+# "node 1" is wherever the writer landed; swap the shells if that was node 2.
+if [ "$(pv_node_id "$PV")" = "$($NODE2_SSH hostname)" ]; then
+  T=$NODE1_SSH; NODE1_SSH=$NODE2_SSH; NODE2_SSH=$T
+fi
 # exec into a Succeeded pod always fails — the writer tees the canary to
 # stdout so we read it from the logs, and it is mandatory.
 CANARY=$(kubectl logs -n "$NS" writer | head -1)
@@ -71,7 +78,7 @@ CANARY=$(kubectl logs -n "$NS" writer | head -1)
 kubectl delete pod -n "$NS" writer --wait
 
 log "test 3 precondition: pre-create a colliding dataset name on both nodes"
-$NODE2_SSH sudo zfs create -V 8M "tank/${OLD_HANDLE}-collision" 2>/dev/null || true
+$NODE2_SSH sudo zfs create -V 8M "$POOL/${OLD_HANDLE}-collision" 2>/dev/null || true
 
 log "trigger evacuation of $PV (handle $OLD_HANDLE)"
 kubectl annotate pv "$PV" zfsevac.alumino.us/evacuate=true
@@ -98,10 +105,10 @@ NEW_HANDLE=$(kubectl get pv "$PV" -o jsonpath='{.spec.csi.volumeHandle}')
 [ "$(kubectl get pvc -n $NS data -o jsonpath='{.spec.volumeName}')" = "$PV" ] || fail "PVC volumeName changed"
 
 log "assert source dataset destroyed, target dataset present, collision untouched"
-$NODE1_SSH sudo zfs list "tank/$OLD_HANDLE" >/dev/null 2>&1 && fail "source dataset still exists"
-$NODE2_SSH sudo zfs list "tank/$NEW_HANDLE" >/dev/null 2>&1 || fail "target dataset missing"
-$NODE2_SSH sudo zfs list "tank/${OLD_HANDLE}-collision" >/dev/null 2>&1 || fail "colliding dataset was destroyed"
-[ -z "$($NODE2_SSH sudo zfs list -H -t snapshot -o name "tank/$NEW_HANDLE" 2>/dev/null)" ] || fail "transfer snapshot leaked on target"
+$NODE1_SSH sudo zfs list "$POOL/$OLD_HANDLE" >/dev/null 2>&1 && fail "source dataset still exists"
+$NODE2_SSH sudo zfs list "$POOL/$NEW_HANDLE" >/dev/null 2>&1 || fail "target dataset missing"
+$NODE2_SSH sudo zfs list "$POOL/${OLD_HANDLE}-collision" >/dev/null 2>&1 || fail "colliding dataset was destroyed"
+[ -z "$($NODE2_SSH sudo zfs list -H -t snapshot -o name "$POOL/$NEW_HANDLE" 2>/dev/null)" ] || fail "transfer snapshot leaked on target"
 [ -z "$(kubectl get zfssnapshots -n openebs -l openebs.io/persistent-volume="$NEW_HANDLE" -o name)" ] || fail "cleanup ZFSSnapshot CR left behind"
 
 log "verify data via a reader pod on the new node"
