@@ -101,6 +101,14 @@ spec:
           status:
             nullable: true
             properties:
+              cancelled:
+                default: false
+                description: |-
+                  This evacuation ended (or is ending) because its trigger condition was
+                  withdrawn — annotation removed, taint removed, PVC gone. A cancelled
+                  Failed CR is replaceable by the trigger; a genuinely failed one is not
+                  (deleting it is the operator's retry gesture).
+                type: boolean
               colocation:
                 description: |-
                   WhenClaimed only: the never-scheduled consumer whose volumes are kept
