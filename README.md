@@ -1,51 +1,48 @@
 # zfs-evacuation-controller
 
-Migrates [openebs zfs-localpv](https://github.com/openebs/zfs-localpv) volumes
-to another node ahead of node removal. zfs-localpv PVs are pinned to one node
-by immutable `nodeAffinity`; upstream has no migration story
-(openebs/zfs-localpv#291, #469). This controller moves the dataset with
-`zfs send`/`zfs recv` and recreates the PV **with the same name**. The PVC and
-everything referencing it stay untouched.
+Move [OpenEBS zfs-localpv](https://github.com/openebs/zfs-localpv) volumes off
+a Kubernetes node before removing it. A zfs-localpv PV is tied to one node by
+immutable `nodeAffinity`, and upstream does not provide volume migration
+(openebs/zfs-localpv#291, #469).
 
-## How it works
+The controller copies the dataset with `zfs send`/`zfs recv`, then recreates
+the PV under its original name. The PVC keeps that PV name, so workloads and
+other objects that refer to it do not need to change.
 
-- **Unprivileged.** No daemonset, no zfs-executing code. The actual
-  `zfs send | nc` and `nc | zfs recv` are performed by zfs-localpv's own node
-  agents, driven through its core `ZFSBackup`/`ZFSRestore` CRs. Both agents
-  dial out; the controller runs a per-attempt TCP relay (two peer-IP-pinned,
-  single-accept listeners) that splices the stream.
-- **Fresh destination identity.** The data lands in a dataset with a new
-  unique name (new `volumeHandle`, e.g. `pvc-xxx-e1a2b3`), so a same-name
-  dataset on the target is never touched. The PV name never changes.
-- **Dataset adoption.** After the receive, the controller creates a ZFSVolume
-  CR for the new dataset; the target node agent adopts the pre-existing
-  dataset and marks it Ready (the same mechanism zfs-localpv's Velero restore
-  relies on).
-- **Attach lock.** A `ValidatingAdmissionPolicy` (k8s ≥ 1.30) guards pod
-  creation against PVCs under evacuation, including generic ephemeral
-  volumes. The locked-PVC sets are delivered via a `paramKind` object
-  maintained by the controller (CEL cannot look up PVCs), one list per
-  evacuation mode: `pvcKeys` (WhenIdle) denies every referencing pod;
-  `claimablePvcKeys` (WhenClaimed) denies only pods that would bypass the
-  source node's cordon (`spec.nodeName`, or a toleration for
-  `node.kubernetes.io/unschedulable`).
-- **Co-location (WhenClaimed).** Volumes are moved with their consumer: the
-  Pending pod left behind by a drain names the group (every ZFS PVC it
-  references), the group's members pick one target under the pod's own
-  placement constraints, and the same Pending pod binds the relocated volumes
-  after the swap. kube-scheduler requeues it on the PV update, so nothing is
-  deleted or recreated.
-- **PV swap.** PV `nodeAffinity` is immutable, so the PV is deleted (its
-  `pv-protection` finalizer stripped after quiescence is verified) and
-  recreated with the same name and a `claimRef` carrying the PVC's UID. The PV
-  controller rebinds the PVC automatically. Both manifests are stored in
-  the ZFSEvacuation status before the delete, so a
-  controller crash mid-swap always resumes.
-- **Safety rails.** The source ZFSVolume gets a guard finalizer (the node
-  agent won't destroy while it's present) and the PV is flipped to `Retain`
-  before anything else happens; the new PV is created as `Retain` and only
-  flipped back to the original policy after it is Bound. The source dataset is
-  destroyed (by deleting its ZFSVolume CR) only after the swap is verified.
+## What the controller does
+
+- It runs without a DaemonSet or code that executes ZFS commands. zfs-localpv's
+  node agents perform `zfs send | nc` and `nc | zfs recv` through their own
+  `ZFSBackup` and `ZFSRestore` CRs. Both agents dial out. For each attempt, the
+  controller relays the stream through two peer-IP-pinned listeners that each
+  accept one connection.
+- The destination dataset gets a new, unique `volumeHandle` (for example,
+  `pvc-xxx-e1a2b3`). A same-named dataset already present on the target is not
+  touched, while the PV name stays the same.
+- After receiving the data, the controller creates a ZFSVolume CR for the new
+  dataset. The target node agent adopts that dataset and marks it Ready, using
+  the same mechanism as zfs-localpv's Velero restore path.
+- A `ValidatingAdmissionPolicy` (Kubernetes 1.30 or later) prevents pods from
+  attaching PVCs being evacuated, including generic ephemeral volumes. The
+  controller maintains the `paramKind` object that supplies the locked PVC
+  sets because CEL cannot look up PVCs. `pvcKeys` (WhenIdle) denies every pod
+  that references a locked PVC. `claimablePvcKeys` (WhenClaimed) denies only
+  pods that could bypass the source node's cordon through `spec.nodeName` or a
+  `node.kubernetes.io/unschedulable` toleration.
+- In WhenClaimed mode, volumes move with their consumer. The Pending pod left
+  by a drain defines the group: all ZFS PVCs it references move to one target
+  that meets the pod's placement constraints and has capacity for the group.
+  After the PV swap, kube-scheduler requeues that same pod and binds it to the
+  relocated volumes. Nothing is deleted or recreated.
+- Because PV `nodeAffinity` is immutable, the controller replaces the PV. It
+  removes `pv-protection` only after verifying quiescence, then recreates the
+  PV with the same name and a `claimRef` containing the PVC UID. The PV
+  controller rebinds the PVC. Both PV manifests are saved in ZFSEvacuation
+  status before the delete so recovery can resume after a controller crash.
+- Before any transfer, the source ZFSVolume receives a guard finalizer and the
+  PV's reclaim policy changes to `Retain`. The replacement PV starts as
+  `Retain`, then returns to the original policy after it is Bound. The source
+  dataset is deleted only after the swap succeeds.
 
 ## Usage
 
