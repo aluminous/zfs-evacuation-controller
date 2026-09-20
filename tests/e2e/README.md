@@ -1,7 +1,7 @@
 # End-to-end test environment
 
-The e2e suite needs a real two-node Kubernetes cluster with ZFS on both nodes
-(macOS containers can't load the zfs kernel module, so this runs in VMs).
+The e2e suite needs a two-node Kubernetes cluster with ZFS on both nodes.
+macOS containers cannot load the ZFS kernel module, so run it in VMs.
 
 ## One-time setup (lima)
 
@@ -28,8 +28,8 @@ parameters: { poolname: tank, fstype: zfs }
 EOF
 ```
 
-Then deploy the controller (`deploy/*.yaml`, image built via the Dockerfile
-and imported into k3s) and run `./run.sh`.
+Then deploy the controller. Build its image with the Dockerfile, import it into
+k3s, and run `./run.sh`.
 
 ## What run.sh covers
 

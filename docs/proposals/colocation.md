@@ -1,11 +1,11 @@
 # Co-locating a consumer's volumes: three approaches, researched
 
 Status: B implemented, 2026-09-03 (`spec.mode`, `status.colocation`,
-`claimablePvcKeys` in EvacuationParams — the list is named
+`claimablePvcKeys` in EvacuationParams. The list is named
 `pvcKeysSchedulerRouted` below; README.md is the current description).
 A and C are not implemented.
 Supersedes the pod-graph proposal of 2026-09-02 (which needed a pod to
-exist at lock time to learn the group — the objection that prompted this).
+exist at lock time to learn the group; that objection prompted this proposal).
 
 ## The problem, in one paragraph
 
@@ -25,7 +25,7 @@ selection is leader/follower on the label.
 
 **Automatic stamping is well-defined.** Both ZFS StorageClasses are
 `WaitForFirstConsumer`, so a PVC binds exactly when the scheduler places
-its first consumer — the pod exists, is scheduled, and its full volume
+its first consumer. The pod exists, is scheduled, and its full volume
 list is known at that moment. The stamper is a pod watch: whenever a pod
 is scheduled, label every ZFS PVC it mounts with the same group id. The
 id should be a content hash of the sorted PVC names, not the pod hash:
@@ -33,22 +33,22 @@ id should be a content hash of the sorted PVC names, not the pod hash:
 on every restart, which would relabel the same volumes forever; a
 content hash is idempotent (no write when nothing changed) and two pods
 mounting the same set agree without coordination. Pods sharing only
-*some* PVCs (P1: A,B; P2: B,C) are the one ambiguity — last writer wins
-— and are rare enough to document rather than solve.
+*some* PVCs (P1: A,B; P2: B,C) are the one ambiguity. Last writer wins, and
+the case is rare enough to document rather than solve.
 
 **What it needs beyond the previous proposal:** the stamper (pod watch,
-PVC patch — RBAC already present, the controller already labels PVCs
+PVC patch; RBAC is already present, and the controller already labels PVCs
 with `evacuating`), a startup backfill from currently-running pods
 (production's volumes bound long before the controller existed), and the
 "partial group" refusal in Pending for Annotation-triggered evacuations
 (NodeTaint annotates the whole node, so groups are complete by
 construction; a sibling that already lives elsewhere is handled by the
 follow rule below). ArgoCD tolerates controller-added labels on managed
-PVCs — the `evacuating` label proves it.
+PVCs; the `evacuating` label proves it.
 
 **What it does not solve.** Selection still runs before any consumer
 exists, so it cannot know whether the group's node is one the consumer
-can actually use (nodeSelector, taints, resources); it only guarantees
+can use (nodeSelector, taints, resources); it only guarantees
 "together". And the workload still has to come back through the attach
 lock: the replacement pod is denied at creation until the swap, so the
 ReplicaSet create-backoff (~10 min for hermes-dev, ~8 min for KubeVirt)
@@ -94,7 +94,7 @@ it, and cordon is enforced by the scheduler for everything without a
 `node.kubernetes.io/unschedulable` toleration. (The evacuate taint is
 `PreferNoSchedule`, so it contributes nothing here; the cordon does the
 work.) The one thing cordon does not stop is a pod created with
-`spec.nodeName` set — those bypass the scheduler entirely — and that is
+`spec.nodeName` set. Those bypass the scheduler entirely, and that is
 exactly what the VAP should keep denying. Concretely: the policy's deny
 expression gains `&& has(object.spec.nodeName) && object.spec.nodeName
 != ''` for keys in a new `params.spec.pvcKeysSchedulerRouted` list;
@@ -112,8 +112,8 @@ the first of the pod's volumes to select takes the summed
 capacity+headroom of all of them and reserves the rest on its target;
 the others follow any sibling that already has a home (`status.target`
 of a sibling's CR, or the sibling's ZFSVolume `ownerNodeID` off the
-source). Idle volumes on the tainted node — nothing references them —
-take the when-idle path unchanged, which is right: there is nothing to
+source). Idle volumes on the tainted node have no consumers, so they take the
+when-idle path unchanged. There is nothing to
 co-locate them *with*. A volume referenced by a still-running pod waits
 for the drain to evict it, as today.
 
@@ -121,22 +121,21 @@ for the drain to evict it, as today.
 can respect the pod's own placement constraints cheaply: required
 nodeAffinity/nodeSelector, and taints vs tolerations, are pure label/
 taint matching; resource fit is not (it needs the scheduler's
-accounting) and is deliberately skipped. A pod that stays Pending on a
+accounting) and is skipped. A pod that stays Pending on a
 Ready target for resource reasons is visible and operator-fixable, and
 its data is no worse off than today. This is the cluster-autoscaler
 posture: it too acts on Pending pods and simulates scheduling against
 the pod's constraints rather than guessing ([CA FAQ, "How does scale-up
-work?"][ca]) — the precedent the mode is modelled on. Where CA answers
+work?"][ca]). That is the precedent the mode follows. Where CA answers
 "add a node this pod fits", when-claimed answers "move this pod's
 volumes to a node it fits".
 
-**A free extra: split repair.** A pod whose volumes already sit on two
+**Additional benefit: split repair.** A pod whose volumes already sit on two
 different nodes is Pending forever with the same affinity conflict, and
 it is *intrinsically* unschedulable everywhere (it needs all its PVs on
 one node), so moving its minority volume is safe without any cordon.
 The same watcher, triggered by the conflict rather than by a taint,
-would have repaired hermes-dev on its own. Worth having but not part of
-the first cut.
+would have repaired hermes-dev on its own. It is outside the first cut.
 
 **What changes in clusterctl.** The wait-for-locks step before the
 drain goes away: the order becomes taint → drain → wait for the node to
@@ -150,7 +149,7 @@ carrying that toleration for locked keys. (2) Annotation-triggered
 evacuations get nothing from this mode unless the operator cordons the
 node; they stay when-idle. (3) A Pending pod that is unschedulable for
 an unrelated reason (resources) would trigger an evacuation of volumes
-that a same-node reschedule could have served — only when the node is
+that a same-node reschedule could have served, but only when the node is
 tainted, i.e. the volumes have to leave anyway. No real cost.
 
 ## C. Operator picks the node by annotation
@@ -166,18 +165,18 @@ the rotation. It also has to be applied before the taint (the trigger
 creates CRs within 15 s of the taint), and it is opt-in: the default
 behaviour still splits, so the operator has to remember, per workload,
 per rotation. As the only mechanism it is a footgun; as the override for
-either A or B it is the right shape and worth doing regardless.
+either A or B it is useful.
 
 ## Recommendation
 
 **B, with C as the override.** B is the only option that gets the group
-definition from the thing that actually needs co-location, keeps the
+definition from the consumer that needs co-location, keeps the
 scheduler in charge of placement (including the pod's own constraints),
 and removes the create-backoff from rotation downtime as a side effect.
 It also shrinks the design: no stamper, no labels to keep fresh, no pod
 graph at lock time, and the attach lock narrows to the one case the
 cordon cannot cover. A holds up technically and is the fallback if some
-consumer turns out never to produce a Pending pod — a bare pod with no
+consumer turns out never to produce a Pending pod. A bare pod with no
 controller is the example, and for that the volume is simply idle after
 the drain and takes the when-idle path, which is correct.
 
@@ -220,7 +219,7 @@ reserves; follower follows `status.target` and ZFSVolume owner;
 nodeSelector excludes a candidate; VAP unit cases (nodeName set vs
 empty, both lists). e2e: two-PVC Deployment, rotate its node with two
 near-equal targets, assert both ZFSVolumes share an owner and that the
-*same pod object* (UID) goes Running on it — the UID assertion is what
+*same pod object* (UID) goes Running on it. The UID assertion is what
 proves no delete/recreate happened.
 
 [vb]: https://github.com/kubernetes/kubernetes/blob/release-1.36/pkg/scheduler/framework/plugins/volumebinding/volume_binding.go
