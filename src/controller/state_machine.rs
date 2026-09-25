@@ -91,6 +91,29 @@ pub fn error_policy(evac: Arc<ZFSEvacuation>, err: &Error, _ctx: Arc<Ctx>) -> Ac
 
 // ---------------------------------------------------------------- helpers
 
+/// A fresh dataset identity, independent of the source handle (including
+/// handles produced by earlier evacuations). Fits Kubernetes label values.
+pub(crate) fn new_destination_handle() -> String {
+    format!("zevac-{:032x}", rand::random::<u128>())
+}
+
+/// The source handle is used verbatim as a ZFSSnapshot label selector. It
+/// names the real dataset, so shortening it would address a different one.
+pub(crate) fn source_handle_fits_snapshot_label(handle: &str) -> bool {
+    handle.len() <= 63
+        && handle
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && handle
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && handle
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 pub async fn advance(
     ctx: &Ctx,
     name: &str,
@@ -261,6 +284,11 @@ async fn pending(
         return fail(ctx, &name, st, format!("PV driver {} is not {ZFS_DRIVER}", csi.driver)).await;
     }
     let handle = csi.volume_handle.clone();
+    if !source_handle_fits_snapshot_label(&handle) {
+        return fail(ctx, &name, st, format!(
+            "source volume handle {handle} cannot be used as a Kubernetes snapshot label value"
+        )).await;
+    }
 
     // Bound PVC with recorded identity.
     let Some(claim) = spec.claim_ref.as_ref() else {
@@ -577,11 +605,7 @@ async fn target_selecting(
     };
     match target::select_target(ctx, &input).await {
         Ok(mut t) => {
-            t.new_volume_handle = format!(
-                "{}-e{:06x}",
-                source.volume_handle,
-                rand::random::<u32>() & 0xff_ffff
-            );
+            t.new_volume_handle = new_destination_handle();
             st.colocation = group.map(|g| {
                 let followed = g.anchor.filter(|_| evac.spec.target_node.is_none());
                 tracing::info!(
