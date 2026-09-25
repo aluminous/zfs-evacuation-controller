@@ -224,6 +224,74 @@ fn target_snapshot_cr_addresses_received_snapshot() {
     assert_eq!(snap.spec.0.extra["recordsize"], "128k");
 }
 
+#[test]
+fn destination_handles_stay_valid_across_repeated_evacuations() {
+    use crate::controller::state_machine::{
+        new_destination_handle, source_handle_fits_snapshot_label,
+    };
+    use crate::controller::target_zfsvolume;
+    use crate::controller::transfer::target_snapshot_cr;
+    use crate::crd::openebs::{VolumeInfo, ZFS_VOL_LABEL};
+    use std::collections::HashSet;
+
+    // A 40-byte provisioned handle reached 64 bytes after three old-style
+    // eight-byte suffixes. Each new destination becomes the next source.
+    let mut source = format!("pvc-{}", "a".repeat(36));
+    assert_eq!(format!("{source}-e000001-e000002-e000003").len(), 64);
+    let mut seen = HashSet::from([source.clone()]);
+    for _ in 0..128 {
+        assert!(source_handle_fits_snapshot_label(&source));
+        let handle = new_destination_handle();
+        assert!(handle.len() <= 63, "{handle}");
+        assert!(
+            handle
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        );
+        assert!(handle.starts_with('z') && handle.ends_with(|c: char| c.is_ascii_alphanumeric()));
+        assert!(seen.insert(handle.clone()), "duplicate destination handle");
+
+        let target = TargetInfo {
+            node: "node-b".into(),
+            node_id: "node-b-id".into(),
+            pool: "tank/csi".into(),
+            new_volume_handle: handle.clone(),
+        };
+        let recovered: TargetInfo = from_value(serde_json::to_value(&target).unwrap()).unwrap();
+        assert_eq!(recovered.new_volume_handle, handle);
+        let zv = target_zfsvolume(VolumeInfo::default(), &target);
+        assert_eq!(zv.name_any(), handle);
+        let snap = target_snapshot_cr(&target, "zevac-a1-beef", VolumeInfo::default());
+        assert_eq!(snap.labels()[ZFS_VOL_LABEL], handle);
+        assert_eq!(
+            format!(
+                "{}/{}@{}",
+                target.pool,
+                snap.labels()[ZFS_VOL_LABEL],
+                snap.name_any()
+            ),
+            format!("tank/csi/{handle}@zevac-a1-beef")
+        );
+        source = handle;
+    }
+    assert_eq!(source.len(), 38);
+}
+
+#[test]
+fn source_handle_must_fit_snapshot_label_without_truncation() {
+    use crate::controller::state_machine::source_handle_fits_snapshot_label;
+
+    assert!(source_handle_fits_snapshot_label(&format!(
+        "pvc-{}",
+        "a".repeat(59)
+    )));
+    assert!(!source_handle_fits_snapshot_label(&format!(
+        "pvc-{}",
+        "a".repeat(60)
+    )));
+    assert!(!source_handle_fits_snapshot_label("bad/handle"));
+}
+
 mod transfer_verdict {
     use crate::controller::transfer::{transfer_verdict, RelayObs, TransferObs, TransferVerdict};
 
